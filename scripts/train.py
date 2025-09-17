@@ -188,6 +188,15 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    # Adaptive token filter metrics (if enabled)
+    if getattr(model, "use_adaptive_token_filter", False):
+        info.update(
+            {
+                "atf_expected_k": jnp.asarray(model.atf_expected_k.value),
+                "atf_kept_frac": jnp.asarray(model.atf_kept_frac.value),
+                "atf_weight": jnp.asarray(config.model.atf_weight, dtype=jnp.float32),
+            }
+        )
     return new_state, info
 
 

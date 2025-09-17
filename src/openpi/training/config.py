@@ -732,6 +732,23 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
+        name="pi0_fast_libero_custom",
+        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(

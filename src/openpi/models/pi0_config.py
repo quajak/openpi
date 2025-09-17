@@ -32,6 +32,14 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Adaptive token filter configuration.
+    use_adaptive_token_filter: bool = True
+    atf_weight: float = 0.02
+    atf_max_k: int = 10
+    atf_hidden_dim: int = 64
+    atf_tau: float = 1.0
+    atf_k_tau: float = 1.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

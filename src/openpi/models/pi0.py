@@ -11,6 +11,7 @@ from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
+from openpi.models.adaptive_token_filter import AdaptiveTokenFilter as _AdaptiveTokenFilter
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -67,6 +68,10 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.use_adaptive_token_filter = config.use_adaptive_token_filter
+        self.atf_weight = jnp.asarray(config.atf_weight, dtype=jnp.float32)
+        self.atf_tau = jnp.asarray(config.atf_tau, dtype=jnp.float32)
+        self.atf_k_tau = jnp.asarray(config.atf_k_tau, dtype=jnp.float32)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -89,6 +94,24 @@ class Pi0(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+
+        # Shared adaptive token filter across all cameras.
+        if self.use_adaptive_token_filter:
+            atf_module = nnx_bridge.ToNNX(
+                _AdaptiveTokenFilter(hidden_dim=config.atf_hidden_dim, max_k=config.atf_max_k)
+            )
+            # Initialize using a dummy token tensor shape; embed dim matches action expert/llm width.
+            atf_module.lazy_init(
+                jax.ShapeDtypeStruct((1, 16, paligemma_config.width), jnp.float32),
+                tau=float(config.atf_tau),
+                k_tau=float(config.atf_k_tau),
+                training=False,
+                rngs=rngs,
+            )
+            self.AdaptiveTokenFilter = atf_module
+            # Stateful variables to expose metrics during training.
+            self.atf_expected_k = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
+            self.atf_kept_frac = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -104,23 +127,58 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_prefix(
-        self, obs: _model.Observation
+        self, obs: _model.Observation, rng: at.KeyArrayLike | None = None
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
         ar_mask = []
         tokens = []
         # embed images
+        kept_count = 0.0
+        total_count = 0.0
+        expected_k = None
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
-
-            tokens.append(image_tokens)
-            input_mask.append(
-                einops.repeat(
+            if getattr(self, "use_adaptive_token_filter", False):
+                # Use training mode when model is non-deterministic
+                training = not self.deterministic
+                # Each camera shares the same filter parameters
+                filtered_embeddings, selection_mask, exp_k = self.AdaptiveTokenFilter(
+                    image_tokens,
+                    tau=float(self.atf_tau),
+                    k_tau=float(self.atf_k_tau),
+                    training=training,
+                    rng=rng if training else None,
+                )
+                image_tokens = filtered_embeddings
+                selection_mask_bool = selection_mask.astype(jnp.bool_)
+                valid_mask = einops.repeat(
                     obs.image_masks[name],
                     "b -> b s",
-                    s=image_tokens.shape[1],
+                    s=selection_mask_bool.shape[1],
                 )
-            )
+                # Update running stats across all cameras
+                kept_count = kept_count + jnp.sum(selection_mask * valid_mask)
+                total_count = total_count + jnp.sum(valid_mask)
+                expected_k = exp_k
+
+                tokens.append(image_tokens)
+                input_mask.append(
+                    einops.repeat(
+                        obs.image_masks[name],
+                        "b -> b s",
+                        s=image_tokens.shape[1],
+                    )
+                    & selection_mask_bool
+                )
+            else:
+                tokens.append(image_tokens)
+                input_mask.append(
+                    einops.repeat(
+                        obs.image_masks[name],
+                        "b -> b s",
+                        s=image_tokens.shape[1],
+                    )
+                )
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
@@ -134,6 +192,13 @@ class Pi0(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
+        # Store ATF monitoring variables
+        if getattr(self, "use_adaptive_token_filter", False):
+            kept_frac = jnp.where(total_count > 0, kept_count / total_count, 0.0)
+            # Persist stats for logging
+            self.atf_kept_frac.value = kept_frac.astype(jnp.float32)
+            if expected_k is not None:
+                self.atf_expected_k.value = jnp.asarray(expected_k, dtype=jnp.float32)
         return tokens, input_mask, ar_mask
 
     @at.typecheck
@@ -189,7 +254,7 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, noise_rng, time_rng, filter_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
@@ -200,7 +265,7 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, rng=filter_rng if train else None)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
@@ -210,8 +275,13 @@ class Pi0(_model.BaseModel):
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        base_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        # Add adaptive token filter penalty normalized by number of cameras.
+        if getattr(self, "use_adaptive_token_filter", False):
+            num_cameras = len(observation.images)
+            penalty = (self.atf_weight * (self.atf_expected_k.value / float(num_cameras))).astype(base_loss.dtype)
+            base_loss = base_loss + penalty
+        return base_loss
 
     @override
     def sample_actions(
@@ -231,7 +301,7 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, rng=None)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
