@@ -69,9 +69,8 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         self.use_adaptive_token_filter = config.use_adaptive_token_filter
-        self.atf_weight = jnp.asarray(config.atf_weight, dtype=jnp.float32)
-        self.atf_tau = jnp.asarray(config.atf_tau, dtype=jnp.float32)
-        self.atf_k_tau = jnp.asarray(config.atf_k_tau, dtype=jnp.float32)
+        self.atf_weight = config.atf_weight
+        self.atf_tau = config.atf_tau
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -100,11 +99,11 @@ class Pi0(_model.BaseModel):
             atf_module = nnx_bridge.ToNNX(
                 _AdaptiveTokenFilter(hidden_dim=config.atf_hidden_dim, max_k=config.atf_max_k)
             )
-            # Initialize using a dummy token tensor shape; embed dim matches action expert/llm width.
+            # Initialize using a dummy token tensor. Use a concrete array to avoid ShapeDtypeStruct promotion issues.
+            dummy_tokens = jnp.zeros((1, 256, paligemma_config.width), dtype=jnp.float32)
             atf_module.lazy_init(
-                jax.ShapeDtypeStruct((1, 16, paligemma_config.width), jnp.float32),
-                tau=float(config.atf_tau),
-                k_tau=float(config.atf_k_tau),
+                dummy_tokens,
+                tau=config.atf_tau,
                 training=False,
                 rngs=rngs,
             )
@@ -144,8 +143,7 @@ class Pi0(_model.BaseModel):
                 # Each camera shares the same filter parameters
                 filtered_embeddings, selection_mask, exp_k = self.AdaptiveTokenFilter(
                     image_tokens,
-                    tau=float(self.atf_tau),
-                    k_tau=float(self.atf_k_tau),
+                    tau=self.atf_tau,
                     training=training,
                     rng=rng if training else None,
                 )

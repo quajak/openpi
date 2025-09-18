@@ -1,30 +1,37 @@
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Tuple, Optional
+import jax.lax as lax
+from typing import Optional, Tuple
 
-def gumbel_softmax_topk(logits: jnp.ndarray, k: int, tau: float = 1.0, 
-                       hard: bool = False, rng: jax.random.PRNGKey = None) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+
+def gumbel_softmax_topk(logits: jnp.ndarray, k: jnp.ndarray, tau: float = 1.0, 
+                       hard: bool = False, rng: jax.random.PRNGKey = None) -> jnp.ndarray:
     """Gumbel-Softmax Top-K sampling in JAX"""
     if rng is not None:
         gumbel_noise = -jnp.log(-jnp.log(jax.random.uniform(rng, logits.shape, minval=1e-8, maxval=1.0-1e-8)))
         perturbed_logits = logits + gumbel_noise
     else:
         perturbed_logits = logits
-    
+
     soft_mask = jax.nn.softmax(perturbed_logits / tau, axis=-1)
     
+
     if hard:
-        # Hard top-k with straight-through estimator
-        top_indices = jnp.argsort(soft_mask, axis=-1)[..., -k:]
-        hard_mask = jnp.zeros_like(soft_mask)
-        hard_mask = hard_mask.at[jnp.arange(hard_mask.shape[0])[:, None], top_indices].set(1.0)
+        sorted = jnp.argsort(soft_mask, axis=-1, descending=True)
+        def set_and_increment(acc, i, ind):
+            acc = acc.at[i, sorted[i, ind]].set(1.0)
+            return acc, ind + 1
+        def one_line_topk(acc, i):
+            return lax.while_loop(lambda ind: ind[1] < k[i], lambda ind: set_and_increment(ind[0], i, ind[1]), (acc, 0))[0]
+        hard_mask = lax.fori_loop(0, soft_mask.shape[0], lambda i, acc: one_line_topk(acc, i), jnp.zeros_like(soft_mask))
         
         # Straight-through: hard forward, soft backward
         mask = jax.lax.stop_gradient(hard_mask - soft_mask) + soft_mask
-        return mask, top_indices
+        return mask
     else:
-        return soft_mask, None
+        return soft_mask
+
 
 class AdaptiveTokenFilter(nn.Module):
     """Adaptive token filter with learnable k using Gumbel-Softmax top-k"""
@@ -33,24 +40,17 @@ class AdaptiveTokenFilter(nn.Module):
     
     def setup(self):
         self.scorer = nn.Sequential([
-            nn.Dense(self.hidden_dim),
+            nn.Dense(self.hidden_dim, dtype=jnp.float32),
             nn.relu,
-            nn.Dense(1)
+            nn.Dense(1, dtype=jnp.float32)
         ])
-        # Learnable parameter for k (logits over possible k values)
-        self.k_logits = self.param('k_logits', nn.initializers.zeros, (self.max_k,))
     
-    def __call__(self, 
-                 token_embeddings: jnp.ndarray,
-                 tau: float = 1.0,
-                 k_tau: float = 1.0,
-                 training: bool = True,
+    def __call__(self, token_embeddings: jnp.ndarray, tau: float = 1.0, training: bool = True,
                  rng: Optional[jax.random.PRNGKey] = None) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         Args:
             token_embeddings: [batch_size, seq_len, embed_dim]
             tau: temperature for token selection
-            k_tau: temperature for k selection
             training: whether in training mode
             rng: random key for Gumbel noise
             
@@ -68,24 +68,10 @@ class AdaptiveTokenFilter(nn.Module):
             rng1, rng2 = jax.random.split(rng)
         else:
             rng1, rng2 = None, None
-        
-        # Sample k using Gumbel-Softmax over possible k values
-        if training and rng1 is not None:
-            k_probs = jax.nn.softmax(self.k_logits / k_tau)
-            k_gumbel = -jnp.log(-jnp.log(jax.random.uniform(rng1, self.k_logits.shape, minval=1e-8, maxval=1.0-1e-8)))
-            k_soft = jax.nn.softmax((self.k_logits + k_gumbel) / k_tau)
-            # Expected k (differentiable)
-            expected_k = jnp.sum(k_soft * jnp.arange(1, self.max_k + 1))
-            # For actual selection, use argmax (hard k)
-            k_selected = jnp.argmax(k_soft) + 1
-        else:
-            k_probs = jax.nn.softmax(self.k_logits)
-            expected_k = jnp.sum(k_probs * jnp.arange(1, self.max_k + 1))
-            k_selected = jnp.argmax(k_probs) + 1
-        
-        # Apply Gumbel-Softmax top-k with the selected k
-        selection_mask, _ = gumbel_softmax_topk(
-            importance_logits, k=k_selected, tau=tau, hard=True, rng=rng2
+
+        expected_k = importance_logits.sum(axis=-1)
+        selection_mask = gumbel_softmax_topk(
+            importance_logits, k=expected_k.astype(jnp.int32), tau=tau, hard=True, rng=rng2
         )
         
         # Apply mask to embeddings

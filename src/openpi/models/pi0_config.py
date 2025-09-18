@@ -38,7 +38,6 @@ class Pi0Config(_model.BaseModelConfig):
     atf_max_k: int = 10
     atf_hidden_dim: int = 64
     atf_tau: float = 1.0
-    atf_k_tau: float = 1.0
 
     def __post_init__(self):
         if self.max_token_len is None:
