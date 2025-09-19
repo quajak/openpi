@@ -36,13 +36,12 @@ def gumbel_softmax_topk(logits: jnp.ndarray, k: jnp.ndarray, tau: float = 1.0,
 class AdaptiveTokenFilter(nn.Module):
     """Adaptive token filter with learnable k using Gumbel-Softmax top-k"""
     hidden_dim: int = 64
-    max_k: int = 10  # Maximum number of tokens to select
     
     def setup(self):
         self.scorer = nn.Sequential([
             nn.Dense(self.hidden_dim, dtype=jnp.float32),
             nn.relu,
-            nn.Dense(1, dtype=jnp.float32)
+            nn.Dense(1, dtype=jnp.float32),
         ])
     
     def __call__(self, token_embeddings: jnp.ndarray, tau: float = 1.0, training: bool = True,
@@ -69,7 +68,7 @@ class AdaptiveTokenFilter(nn.Module):
         else:
             rng1, rng2 = None, None
 
-        expected_k = importance_logits.sum(axis=-1)
+        expected_k = nn.sigmoid(importance_logits).sum(axis=-1)
         selection_mask = gumbel_softmax_topk(
             importance_logits, k=expected_k.astype(jnp.int32), tau=tau, hard=True, rng=rng2
         )

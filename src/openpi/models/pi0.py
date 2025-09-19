@@ -97,7 +97,7 @@ class Pi0(_model.BaseModel):
         # Shared adaptive token filter across all cameras.
         if self.use_adaptive_token_filter:
             atf_module = nnx_bridge.ToNNX(
-                _AdaptiveTokenFilter(hidden_dim=config.atf_hidden_dim, max_k=config.atf_max_k)
+                _AdaptiveTokenFilter(hidden_dim=config.atf_hidden_dim)
             )
             # Initialize using a dummy token tensor. Use a concrete array to avoid ShapeDtypeStruct promotion issues.
             dummy_tokens = jnp.zeros((1, 256, paligemma_config.width), dtype=jnp.float32)
@@ -166,7 +166,7 @@ class Pi0(_model.BaseModel):
                         "b -> b s",
                         s=image_tokens.shape[1],
                     )
-                    & selection_mask_bool
+                    #& selection_mask_bool
                 )
             else:
                 tokens.append(image_tokens)
@@ -277,8 +277,8 @@ class Pi0(_model.BaseModel):
         # Add adaptive token filter penalty normalized by number of cameras.
         if getattr(self, "use_adaptive_token_filter", False):
             num_cameras = len(observation.images)
-            penalty = (self.atf_weight * (self.atf_expected_k.value / float(num_cameras))).astype(base_loss.dtype)
-            base_loss = base_loss + penalty
+            penalty = (self.atf_weight * (self.atf_expected_k.value)).astype(base_loss.dtype)
+            return base_loss + jnp.expand_dims(jnp.squeeze(penalty), -1)
         return base_loss
 
     @override
