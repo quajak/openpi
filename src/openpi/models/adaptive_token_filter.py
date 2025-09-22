@@ -69,7 +69,11 @@ class AdaptiveTokenFilter(nn.Module):
         else:
             rng1, rng2 = None, None
 
-        expected_k = importance_logits.sum(axis=-1)
+        # Use sigmoid to convert logits to selection probabilities (0-1)
+        # Sum these probabilities to get expected number of tokens to select
+        # This allows for adaptive selection while ensuring positive, bounded values
+        selection_probs = jax.nn.sigmoid(importance_logits)
+        expected_k = selection_probs.sum(axis=-1)
         selection_mask = gumbel_softmax_topk(
             importance_logits, k=expected_k.astype(jnp.int32), tau=tau, hard=True, rng=rng2
         )

@@ -277,7 +277,7 @@ class Pi0(_model.BaseModel):
         # Add adaptive token filter penalty normalized by number of cameras.
         if getattr(self, "use_adaptive_token_filter", False):
             num_cameras = len(observation.images)
-            penalty = (self.atf_weight * (self.atf_expected_k.value / float(num_cameras))).astype(base_loss.dtype)
+            penalty = (self.atf_weight * (self.atf_expected_k.value)).astype(base_loss.dtype)
             base_loss = base_loss + penalty
         return base_loss
 
