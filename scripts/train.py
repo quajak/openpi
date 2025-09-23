@@ -148,15 +148,15 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        chunked_loss, info = model.compute_loss(rng, observation, actions, train=True)
+        return jnp.mean(chunked_loss), info
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    loss, grads, loss_info = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model, train_rng, observation, actions)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -188,16 +188,7 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
-    }
-    # Adaptive token filter metrics (if enabled)
-    if getattr(model, "use_adaptive_token_filter", False):
-        info.update(
-            {
-                "atf_expected_k": jnp.asarray(model.atf_expected_k.value),
-                "atf_kept_frac": jnp.asarray(model.atf_kept_frac.value),
-                "atf_weight": jnp.asarray(config.model.atf_weight, dtype=jnp.float32),
-            }
-        )
+    } | loss_info
     return new_state, info
 
 

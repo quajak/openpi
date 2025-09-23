@@ -5,6 +5,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+from typing import Any
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -127,21 +128,21 @@ class Pi0(_model.BaseModel):
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation, rng: at.KeyArrayLike | None = None
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], dict[str, Any]]:
         input_mask = []
         ar_mask = []
         tokens = []
         # embed images
-        kept_count = 0.0
-        total_count = 0.0
-        expected_k = None
+        avg_kept_counts = []
+        avg_total_counts = []
+        avg_expected_ks = []
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
             if getattr(self, "use_adaptive_token_filter", False):
                 # Use training mode when model is non-deterministic
                 training = not self.deterministic
                 # Each camera shares the same filter parameters
-                filtered_embeddings, selection_mask, exp_k = self.AdaptiveTokenFilter(
+                filtered_embeddings, selection_mask, expected_k = self.AdaptiveTokenFilter(
                     image_tokens,
                     tau=self.atf_tau,
                     training=training,
@@ -155,9 +156,9 @@ class Pi0(_model.BaseModel):
                     s=selection_mask_bool.shape[1],
                 )
                 # Update running stats across all cameras
-                kept_count = kept_count + jnp.sum(selection_mask * valid_mask)
-                total_count = total_count + jnp.sum(valid_mask)
-                expected_k = exp_k
+                avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
+                avg_total_counts.append(jnp.sum(valid_mask))
+                avg_expected_ks.append(expected_k.mean())
 
                 tokens.append(image_tokens)
                 input_mask.append(
@@ -191,13 +192,18 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         # Store ATF monitoring variables
+        info = {}
         if getattr(self, "use_adaptive_token_filter", False):
-            kept_frac = jnp.where(total_count > 0, kept_count / total_count, 0.0)
+            kept_frac = jnp.where(avg_total_counts > 0, avg_kept_counts / avg_total_counts, 0.0).mean()
             # Persist stats for logging
-            self.atf_kept_frac.value = kept_frac.astype(jnp.float32)
-            if expected_k is not None:
-                self.atf_expected_k.value = jnp.asarray(expected_k, dtype=jnp.float32)
-        return tokens, input_mask, ar_mask
+            info["atf_kept_frac"] = kept_frac.astype(jnp.float32)
+            if avg_expected_ks is not None:
+                info["atf_expected_k"] = jnp.asarray(avg_expected_ks, dtype=jnp.float32).mean()
+
+            for i, name in enumerate(obs.images):
+                info[f"per_camera_pruning/{name}/kept_frac"] = avg_kept_counts[i].astype(jnp.float32) / avg_total_counts[i].astype(jnp.float32)
+                info[f"per_camera_pruning/{name}/expected_k"] = avg_expected_ks[i].astype(jnp.float32)
+        return tokens, input_mask, ar_mask, info
 
     @at.typecheck
     def embed_suffix(
@@ -251,7 +257,7 @@ class Pi0(_model.BaseModel):
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, Any]]:
         preprocess_rng, noise_rng, time_rng, filter_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -263,7 +269,7 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, rng=filter_rng if train else None)
+        prefix_tokens, prefix_mask, prefix_ar_mask, info = self.embed_prefix(observation, rng=filter_rng if train else None)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
@@ -276,10 +282,9 @@ class Pi0(_model.BaseModel):
         base_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
         # Add adaptive token filter penalty normalized by number of cameras.
         if getattr(self, "use_adaptive_token_filter", False):
-            num_cameras = len(observation.images)
             penalty = (self.atf_weight * (self.atf_expected_k.value)).astype(base_loss.dtype)
             return base_loss + jnp.expand_dims(jnp.squeeze(penalty), -1)
-        return base_loss
+        return base_loss, info
 
     @override
     def sample_actions(
@@ -299,7 +304,7 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, rng=None)
+        prefix_tokens, prefix_mask, prefix_ar_mask, _ = self.embed_prefix(observation, rng=None)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)

@@ -61,8 +61,7 @@ class ToyTransformer(nn.Module):
         
         if self.use_adaptive_filter:
             self.token_filter = AdaptiveTokenFilter(
-                hidden_dim=self.filter_hidden_dim,
-                max_k=self.filter_max_k
+                hidden_dim=self.filter_hidden_dim
             )
         
         # Transformer layers
@@ -328,7 +327,7 @@ def main():
     
     # Training parameters
     batch_size = 32
-    num_epochs = 200
+    num_epochs = 600
     learning_rate = 1e-3
     
     # Create model

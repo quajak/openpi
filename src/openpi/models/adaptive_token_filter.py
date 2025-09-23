@@ -16,7 +16,6 @@ def gumbel_softmax_topk(logits: jnp.ndarray, k: jnp.ndarray, tau: float = 1.0,
 
     soft_mask = jax.nn.softmax(perturbed_logits / tau, axis=-1)
     
-
     if hard:
         sorted = jnp.argsort(soft_mask, axis=-1, descending=True)
         def set_and_increment(acc, i, ind):
@@ -27,7 +26,7 @@ def gumbel_softmax_topk(logits: jnp.ndarray, k: jnp.ndarray, tau: float = 1.0,
         hard_mask = lax.fori_loop(0, soft_mask.shape[0], lambda i, acc: one_line_topk(acc, i), jnp.zeros_like(soft_mask))
         
         # Straight-through: hard forward, soft backward
-        mask = jax.lax.stop_gradient(hard_mask - soft_mask) + soft_mask
+        mask = lax.stop_gradient(hard_mask - soft_mask) + soft_mask
         return mask
     else:
         return soft_mask
@@ -64,9 +63,9 @@ class AdaptiveTokenFilter(nn.Module):
         importance_logits = self.scorer(token_embeddings).squeeze(-1)  # [batch, seq_len]
         
         if training and rng is not None:
-            rng1, rng2 = jax.random.split(rng)
+            rng, rng2 = jax.random.split(rng)
         else:
-            rng1, rng2 = None, None
+            rng, rng2 = None, None
 
         expected_k = nn.sigmoid(importance_logits).sum(axis=-1)
         selection_mask = gumbel_softmax_topk(
