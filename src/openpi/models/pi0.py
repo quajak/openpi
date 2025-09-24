@@ -12,7 +12,7 @@ from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
-from openpi.models.adaptive_token_filter import AdaptiveTokenFilter as _AdaptiveTokenFilter
+from openpi.models.adaptive_token_filter import AdaptiveTokenFilter as _AdaptiveTokenFilter, TokenCountValueFunction
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -98,7 +98,7 @@ class Pi0(_model.BaseModel):
         # Shared adaptive token filter across all cameras.
         if self.use_adaptive_token_filter:
             atf_module = nnx_bridge.ToNNX(
-                _AdaptiveTokenFilter(hidden_dim=config.atf_hidden_dim)
+                _AdaptiveTokenFilter(hidden_dim=config.atf_hidden_dim, max_tokens=256)
             )
             # Initialize using a dummy token tensor. Use a concrete array to avoid ShapeDtypeStruct promotion issues.
             dummy_tokens = jnp.zeros((1, 256, paligemma_config.width), dtype=jnp.float32)
@@ -109,9 +109,21 @@ class Pi0(_model.BaseModel):
                 rngs=rngs,
             )
             self.AdaptiveTokenFilter = atf_module
+            
+            # Initialize value function for token count vs loss prediction
+            self.value_function = TokenCountValueFunction(
+                max_tokens=256,
+                hidden_dim=config.atf_hidden_dim,
+                num_layers=2,
+                num_heads=4,
+                rngs=rngs
+            )
+            
             # Stateful variables to expose metrics during training.
             self.atf_expected_k = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
             self.atf_kept_frac = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
+            self.value_function_loss = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
+            self.training_step = nnx.Variable(jnp.array(0, dtype=jnp.int32))
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -142,11 +154,12 @@ class Pi0(_model.BaseModel):
                 # Use training mode when model is non-deterministic
                 training = not self.deterministic
                 # Each camera shares the same filter parameters
-                filtered_embeddings, selection_mask, expected_k = self.AdaptiveTokenFilter(
+                filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
                     image_tokens,
                     tau=self.atf_tau,
                     training=training,
                     rng=rng if training else None,
+                    step=int(self.training_step.value),
                 )
                 image_tokens = filtered_embeddings
                 selection_mask_bool = selection_mask.astype(jnp.bool_)
@@ -203,6 +216,13 @@ class Pi0(_model.BaseModel):
             for i, name in enumerate(obs.images):
                 info[f"per_camera_pruning/{name}/kept_frac"] = avg_kept_counts[i].astype(jnp.float32) / avg_total_counts[i].astype(jnp.float32)
                 info[f"per_camera_pruning/{name}/expected_k"] = avg_expected_ks[i].astype(jnp.float32)
+            
+            # Add value function metrics from the last ATF call
+            info |= atf_info
+            
+            # Store selection masks for loss calculation
+            if "selection_mask" in atf_info:
+                info["image_selection_masks"] = atf_info["selection_mask"]
         return tokens, input_mask, ar_mask, info
 
     @at.typecheck
@@ -258,7 +278,7 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, Any]]:
-        preprocess_rng, noise_rng, time_rng, filter_rng = jax.random.split(rng, 4)
+        preprocess_rng, noise_rng, time_rng, filter_rng, value_rng = jax.random.split(rng, 5)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
@@ -280,10 +300,51 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
         base_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        
         # Add adaptive token filter penalty normalized by number of cameras.
         if getattr(self, "use_adaptive_token_filter", False):
-            penalty = (self.atf_weight * (self.atf_expected_k.value)).astype(base_loss.dtype)
-            return base_loss + jnp.expand_dims(jnp.squeeze(penalty), -1)
+            # Check if we're using predicted loss function
+            using_predicted_loss = train and "predicted_losses" in info
+            
+            if not using_predicted_loss:
+                # Add penalty only when not using predicted loss function
+                penalty = (self.atf_weight * (self.atf_expected_k.value)).astype(base_loss.dtype)
+                total_loss = base_loss + jnp.expand_dims(jnp.squeeze(penalty), -1)
+            else:
+                total_loss = base_loss
+            
+            # Compute value function loss if training
+            if train:
+                # Update training step
+                self.training_step.value = self.training_step.value + 1
+                
+                actual_token_counts = jnp.sum(info["image_selection_masks"], axis=-1)  # [batch_size]
+                
+                predicted_losses = info["predicted_losses"]  # [batch_size, max_tokens]
+                
+                # Get predicted loss for actual token counts
+                batch_size = actual_token_counts.shape[0]
+                predicted_loss_for_counts = jnp.zeros(batch_size)
+                
+                for i in range(batch_size):
+                    token_count = int(actual_token_counts[i])
+                    predicted_loss_for_counts = predicted_loss_for_counts.at[i].set(predicted_losses[i, token_count - 1])
+                
+                # Value function loss: MSE between predicted and actual loss
+                actual_loss_detached = jax.lax.stop_gradient(base_loss)
+                value_function_loss = jnp.mean(jnp.square(predicted_loss_for_counts - actual_loss_detached))
+                self.value_function_loss.value = value_function_loss
+                
+                # Add value function loss to total loss
+                total_loss = total_loss + jnp.expand_dims(value_function_loss, -1)
+                
+                # Add value function metrics to info
+                info["value_function_loss"] = value_function_loss
+                info["value_function_predicted_loss"] = jnp.mean(predicted_loss_for_counts)
+                info["value_function_actual_loss"] = jnp.mean(actual_loss_detached)
+                info["training_step"] = self.training_step.value
+            
+            return total_loss, info
         return base_loss, info
 
     @override
