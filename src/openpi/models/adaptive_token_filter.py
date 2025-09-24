@@ -6,6 +6,27 @@ from typing import Optional, Tuple
 import flax.nnx as nnx
 
 
+class MLP(nnx.Module):
+    """Multi-layer perceptron using nnx.Linear layers"""
+    
+    def __init__(self, features: list[int], *, rngs: nnx.Rngs):
+        super().__init__()
+        self.features = features
+        self.layers = []
+        
+        for i in range(len(features) - 1):
+            self.layers.append(nnx.Linear(features[i], features[i + 1], rngs=rngs))
+    
+    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
+        """Forward pass through MLP layers"""
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            # Apply ReLU activation except for the last layer
+            if i < len(self.layers) - 1:
+                x = nnx.relu(x)
+        return x
+
+
 def gumbel_softmax_topk(logits: jnp.ndarray, k: jnp.ndarray, tau: float = 1.0, 
                        hard: bool = False, rng: jax.random.PRNGKey = None) -> jnp.ndarray:
     """Gumbel-Softmax Top-K sampling in JAX"""
@@ -53,15 +74,15 @@ class TokenCountValueFunction(nnx.Module):
         for _ in range(num_layers):
             self.transformer_layers.append(nnx.MultiHeadAttention(
                 num_heads=num_heads,
-                features=hidden_dim,
+                in_features=hidden_dim,
                 rngs=rngs
             ))
             self.batch_norms.append(nnx.BatchNorm(hidden_dim, rngs=rngs))
-            self.transformer_layers.append(nnx.MLP([hidden_dim * 4, hidden_dim], rngs=rngs))
+            self.transformer_layers.append(MLP([hidden_dim * 4, hidden_dim], rngs=rngs))
             self.batch_norms.append(nnx.BatchNorm(hidden_dim, rngs=rngs))
         
         # MLP to predict residual loss increases for each token position
-        self.residual_mlp = nnx.MLP([hidden_dim, hidden_dim * 2, max_tokens], rngs=rngs)
+        self.residual_mlp = MLP([hidden_dim, hidden_dim * 2, max_tokens], rngs=rngs)
     
     def __call__(self, image_tokens: jnp.ndarray, training: bool = True) -> jnp.ndarray:
         """
