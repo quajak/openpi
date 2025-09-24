@@ -120,8 +120,6 @@ class Pi0(_model.BaseModel):
             )
             
             # Stateful variables to expose metrics during training.
-            self.atf_expected_k = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
-            self.atf_kept_frac = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
             self.value_function_loss = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
             self.training_step = nnx.Variable(jnp.array(0, dtype=jnp.int32))
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
@@ -168,10 +166,6 @@ class Pi0(_model.BaseModel):
                     "b -> b s",
                     s=selection_mask_bool.shape[1],
                 )
-                # Update running stats across all cameras
-                avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
-                avg_total_counts.append(jnp.sum(valid_mask))
-                avg_expected_ks.append(expected_k.mean())
 
                 tokens.append(image_tokens)
                 input_mask.append(
@@ -182,6 +176,11 @@ class Pi0(_model.BaseModel):
                     )
                     #& selection_mask_bool
                 )
+
+                # Update running stats across all cameras
+                avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
+                avg_total_counts.append(jnp.sum(valid_mask))
+                avg_expected_ks.append(expected_k.mean())
             else:
                 tokens.append(image_tokens)
                 input_mask.append(
@@ -207,14 +206,14 @@ class Pi0(_model.BaseModel):
         # Store ATF monitoring variables
         info = {}
         if getattr(self, "use_adaptive_token_filter", False):
-            kept_frac = jnp.where(avg_total_counts > 0, avg_kept_counts / avg_total_counts, 0.0).mean()
+            kept_frac = sum(avg_kept_counts)/sum(avg_total_counts)
             # Persist stats for logging
             info["atf_kept_frac"] = kept_frac.astype(jnp.float32)
-            if avg_expected_ks is not None:
-                info["atf_expected_k"] = jnp.asarray(avg_expected_ks, dtype=jnp.float32).mean()
+            info["atf_expected_k"] = jnp.asarray(avg_expected_ks, dtype=jnp.float32).mean()
 
             for i, name in enumerate(obs.images):
                 info[f"per_camera_pruning/{name}/kept_frac"] = avg_kept_counts[i].astype(jnp.float32) / avg_total_counts[i].astype(jnp.float32)
+                info[f"per_camera_pruning/{name}/total_counts"] = avg_total_counts[i].astype(jnp.float32)
                 info[f"per_camera_pruning/{name}/expected_k"] = avg_expected_ks[i].astype(jnp.float32)
             
             # Add value function metrics from the last ATF call
@@ -308,8 +307,8 @@ class Pi0(_model.BaseModel):
             
             if not using_predicted_loss:
                 # Add penalty only when not using predicted loss function
-                penalty = (self.atf_weight * (self.atf_expected_k.value)).astype(base_loss.dtype)
-                total_loss = base_loss + jnp.expand_dims(jnp.squeeze(penalty), -1)
+                penalty = (self.atf_weight * info['atf_expected_k']).astype(base_loss.dtype)
+                return base_loss + jnp.expand_dims(jnp.squeeze(penalty), -1), info
             else:
                 total_loss = base_loss
             

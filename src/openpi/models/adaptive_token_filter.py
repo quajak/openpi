@@ -185,7 +185,7 @@ class AdaptiveTokenFilter(nn.Module):
             expected_k = nn.sigmoid(importance_logits).sum(axis=-1)
         
         selection_mask = gumbel_softmax_topk(
-            importance_logits, k=expected_k.astype(jnp.int32), tau=tau, hard=True, rng=rng2
+            importance_logits, k=jnp.clip(expected_k.astype(jnp.int32), min=32), tau=tau, hard=True, rng=rng2
         )
         
         # Apply mask to embeddings
