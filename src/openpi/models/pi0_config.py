@@ -34,7 +34,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     # Adaptive token filter configuration.
     use_adaptive_token_filter: bool = True
-    atf_weight: float = 0.0001
+    atf_weight: float = 0.000001
     atf_hidden_dim: int = 64
     atf_tau: float = 1.0
 
