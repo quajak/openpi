@@ -263,12 +263,13 @@ def main(config: _config.TrainConfig):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
+            breakpoint()
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             
             # Handle value function distribution logging
             log_info = {}
-            for k, v in reduced_info.items():
+            for k, v in stacked_infos.items():
                 if k == "value_function_distribution" and isinstance(v, dict):
                     # Log the distribution as a wandb plot
                     fig, ax = plt.subplots(figsize=(12, 8))

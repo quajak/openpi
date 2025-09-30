@@ -12,17 +12,18 @@ class MLP(nnx.Module):
     def __init__(self, features: list[int], *, rngs: nnx.Rngs):
         super().__init__()
         self.features = features
-        self.layers = []
+        self.layers = {}
+        self.num_layers = len(features) - 1
         
         for i in range(len(features) - 1):
-            self.layers.append(nnx.Linear(features[i], features[i + 1], rngs=rngs))
+            self.layers[f'l_{i}'] = nnx.Linear(features[i], features[i + 1], rngs=rngs)
     
     def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
         """Forward pass through MLP layers"""
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
+        for i in range(self.num_layers):
+            x = self.layers['l_{i}'](x)
             # Apply ReLU activation except for the last layer
-            if i < len(self.layers) - 1:
+            if i < self.num_layers - 1:
                 x = nnx.relu(x)
         return x
 
@@ -69,17 +70,18 @@ class TokenCountValueFunction(nnx.Module):
         self.num_heads = num_heads
         
         # Transformer layers with batch normalization
-        self.transformer_layers = []
-        self.batch_norms = []
-        for _ in range(num_layers):
-            self.transformer_layers.append(nnx.MultiHeadAttention(
+        self.transformer_layers = {}
+        self.mlp_layers = {}
+        self.batch_norms = {}
+        for i in range(num_layers):
+            self.transformer_layers[f'l_{i}'] = nnx.MultiHeadAttention(
                 num_heads=num_heads,
                 in_features=hidden_dim,
                 rngs=rngs
-            ))
-            self.batch_norms.append(nnx.BatchNorm(hidden_dim, rngs=rngs))
-            self.transformer_layers.append(MLP([hidden_dim * 4, hidden_dim], rngs=rngs))
-            self.batch_norms.append(nnx.BatchNorm(hidden_dim, rngs=rngs))
+            )
+            self.batch_norms[f'l_{i}'] = nnx.BatchNorm(hidden_dim, rngs=rngs)
+            self.transformer_layers[f'l_{i}'] = MLP([hidden_dim * 4, hidden_dim], rngs=rngs)
+            self.batch_norms[f'l_{i}'] = nnx.BatchNorm(hidden_dim, rngs=rngs)
         
         # MLP to predict residual loss increases for each token position
         self.residual_mlp = MLP([hidden_dim, hidden_dim * 2, max_tokens], rngs=rngs)
@@ -97,19 +99,19 @@ class TokenCountValueFunction(nnx.Module):
         # Apply transformer layers with batch normalization
         x = image_tokens
         bn_idx = 0
-        for i in range(0, len(self.transformer_layers), 2):
-            attn_layer = self.transformer_layers[i]
-            mlp_layer = self.transformer_layers[i + 1]
+        for i in range(self.num_layers):
+            attn_layer = self.transformer_layers[f'l_{i}']
+            mlp_layer = self.transformer_layers[f'l_{i}']
             
             # Self-attention
             x = attn_layer(x, training=training)
-            x = self.batch_norms[bn_idx](x, training=training)
+            x = self.batch_norms[f'l_{i}'](x, training=training)
             x = nnx.relu(x)
             bn_idx += 1
             
             # MLP
             x = mlp_layer(x, training=training)
-            x = self.batch_norms[bn_idx](x, training=training)
+            x = self.batch_norms[f'l_{i}'](x, training=training)
             x = nnx.relu(x)
             bn_idx += 1
         
@@ -132,22 +134,21 @@ class AdaptiveTokenFilter(nn.Module):
     use_value_function: bool = True
     random_k_prob: float = 1.0  # Probability of using random k selection
     random_k_decay: float = 0.99  # Decay rate for random k probability
-    
+
     def setup(self):
         self.scorer = nn.Sequential([
             nn.Dense(self.hidden_dim, dtype=jnp.float32),
             nn.relu,
             nn.Dense(1, dtype=jnp.float32),
         ])
-        
-        if self.use_value_function:
-            # Initialize value function (will be set externally)
-            self.value_function = None
-    
-    def set_value_function(self, value_function: TokenCountValueFunction):
-        """Set the value function model"""
-        self.value_function = value_function
-    
+        self.value_function = TokenCountValueFunction(
+            max_tokens= 256,
+            hidden_dim= self.hidden_dim,
+            num_layers= 2,
+            num_heads= 4,
+            rngs= rngs
+        )
+                
     def set_random_k_prob(self, prob: float):
         """Update the probability of using random k selection"""
         self.random_k_prob = prob
@@ -219,6 +220,7 @@ class AdaptiveTokenFilter(nn.Module):
             "selection_mask": selection_mask,  # Pass selection mask for loss calculation
         }
         
+        breakpoint()
         if self.use_value_function and self.value_function is not None and training:
             current_random_prob = self.random_k_prob * (self.random_k_decay ** step)
             info["random_k_prob"] = current_random_prob

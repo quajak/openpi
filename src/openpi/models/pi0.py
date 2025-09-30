@@ -97,9 +97,8 @@ class Pi0(_model.BaseModel):
 
         # Shared adaptive token filter across all cameras.
         if self.use_adaptive_token_filter:
-            atf_module = nnx_bridge.ToNNX(
-                _AdaptiveTokenFilter(hidden_dim=config.atf_hidden_dim, max_tokens=256)
-            )
+            atf = _AdaptiveTokenFilter(hidden_dim=config.atf_hidden_dim, max_tokens=256)
+            atf_module = nnx_bridge.ToNNX(atf)
             # Initialize using a dummy token tensor. Use a concrete array to avoid ShapeDtypeStruct promotion issues.
             dummy_tokens = jnp.zeros((1, 256, paligemma_config.width), dtype=jnp.float32)
             atf_module.lazy_init(
@@ -110,14 +109,6 @@ class Pi0(_model.BaseModel):
             )
             self.AdaptiveTokenFilter = atf_module
             
-            # Initialize value function for token count vs loss prediction
-            self.value_function = TokenCountValueFunction(
-                max_tokens=256,
-                hidden_dim=config.atf_hidden_dim,
-                num_layers=2,
-                num_heads=4,
-                rngs=rngs
-            )
             
             # Stateful variables to expose metrics during training.
             self.value_function_loss = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
@@ -157,7 +148,7 @@ class Pi0(_model.BaseModel):
                     tau=self.atf_tau,
                     training=training,
                     rng=rng if training else None,
-                    step=int(self.training_step.value),
+                    step=self.training_step.value,
                 )
                 image_tokens = filtered_embeddings
                 selection_mask_bool = selection_mask.astype(jnp.bool_)
@@ -217,6 +208,7 @@ class Pi0(_model.BaseModel):
                 info[f"per_camera_pruning/{name}/expected_k"] = avg_expected_ks[i].astype(jnp.float32)
             
             # Add value function metrics from the last ATF call
+            breakpoint()
             info |= atf_info
             
             # Store selection masks for loss calculation
