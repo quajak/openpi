@@ -263,21 +263,24 @@ def main(config: _config.TrainConfig):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
-            breakpoint()
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             
             # Handle value function distribution logging
             log_info = {}
-            for k, v in stacked_infos.items():
-                if k == "value_function_distribution" and isinstance(v, dict):
+            for k, v in reduced_info.items():
+                if k == "value_function_distribution" and isinstance(v, dict) and v["populated"]:
+                    if len(v['predicted_losses'].shape) == 0:
+                        continue
                     # Log the distribution as a wandb plot
                     fig, ax = plt.subplots(figsize=(12, 8))
                     
                     # Plot both raw and normalized losses
-                    ax.plot(v["token_counts"], v["predicted_losses"], 'b-', linewidth=2, label='Predicted Loss')
+                    length = len(v["predicted_losses"])
+                    x = jnp.arange(1, length + 1)
+                    ax.plot(x, v["predicted_losses"], 'b-', linewidth=2, label='Predicted Loss')
                     ax2 = ax.twinx()
-                    ax2.plot(v["token_counts"], v["normalized_losses"], 'r--', linewidth=2, label='Normalized Loss')
+                    ax2.plot(x, v["normalized_losses"], 'r--', linewidth=2, label='Normalized Loss')
                     
                     # Add 0.2 threshold line
                     ax2.axhline(y=0.2, color='g', linestyle=':', linewidth=2, label='0.2 Threshold')

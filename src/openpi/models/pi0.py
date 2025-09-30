@@ -97,17 +97,12 @@ class Pi0(_model.BaseModel):
 
         # Shared adaptive token filter across all cameras.
         if self.use_adaptive_token_filter:
-            atf = _AdaptiveTokenFilter(hidden_dim=config.atf_hidden_dim, max_tokens=256)
-            atf_module = nnx_bridge.ToNNX(atf)
-            # Initialize using a dummy token tensor. Use a concrete array to avoid ShapeDtypeStruct promotion issues.
-            dummy_tokens = jnp.zeros((1, 256, paligemma_config.width), dtype=jnp.float32)
-            atf_module.lazy_init(
-                dummy_tokens,
-                tau=config.atf_tau,
-                training=False,
-                rngs=rngs,
+            self.AdaptiveTokenFilter = _AdaptiveTokenFilter(
+                input_dim=paligemma_config.width,
+                hidden_dim=config.atf_hidden_dim, 
+                max_tokens=256,
+                rngs=rngs
             )
-            self.AdaptiveTokenFilter = atf_module
             
             
             # Stateful variables to expose metrics during training.
@@ -208,7 +203,6 @@ class Pi0(_model.BaseModel):
                 info[f"per_camera_pruning/{name}/expected_k"] = avg_expected_ks[i].astype(jnp.float32)
             
             # Add value function metrics from the last ATF call
-            breakpoint()
             info |= atf_info
             
             # Store selection masks for loss calculation
@@ -318,12 +312,12 @@ class Pi0(_model.BaseModel):
                 predicted_loss_for_counts = jnp.zeros(batch_size)
                 
                 for i in range(batch_size):
-                    token_count = int(actual_token_counts[i])
+                    token_count = actual_token_counts[i].astype(jnp.int32)
                     predicted_loss_for_counts = predicted_loss_for_counts.at[i].set(predicted_losses[i, token_count - 1])
                 
                 # Value function loss: MSE between predicted and actual loss
                 actual_loss_detached = jax.lax.stop_gradient(base_loss)
-                value_function_loss = jnp.mean(jnp.square(predicted_loss_for_counts - actual_loss_detached))
+                value_function_loss = jnp.mean(jnp.square(predicted_loss_for_counts - actual_loss_detached.mean(-1)))
                 self.value_function_loss.value = value_function_loss
                 
                 # Add value function loss to total loss

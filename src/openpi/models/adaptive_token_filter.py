@@ -21,7 +21,7 @@ class MLP(nnx.Module):
     def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
         """Forward pass through MLP layers"""
         for i in range(self.num_layers):
-            x = self.layers['l_{i}'](x)
+            x = self.layers[f'l_{i}'](x)
             # Apply ReLU activation except for the last layer
             if i < self.num_layers - 1:
                 x = nnx.relu(x)
@@ -74,19 +74,20 @@ class TokenCountValueFunction(nnx.Module):
         self.mlp_layers = {}
         self.batch_norms = {}
         for i in range(num_layers):
-            self.transformer_layers[f'l_{i}'] = nnx.MultiHeadAttention(
+            self.transformer_layers[f'a_{i}'] = nnx.MultiHeadAttention(
                 num_heads=num_heads,
                 in_features=hidden_dim,
-                rngs=rngs
+                rngs=rngs,
+                decode=False
             )
-            self.batch_norms[f'l_{i}'] = nnx.BatchNorm(hidden_dim, rngs=rngs)
-            self.transformer_layers[f'l_{i}'] = MLP([hidden_dim * 4, hidden_dim], rngs=rngs)
+            self.batch_norms[f'a_{i}'] = nnx.BatchNorm(hidden_dim, rngs=rngs)
+            self.transformer_layers[f'l_{i}'] = MLP([hidden_dim, hidden_dim], rngs=rngs)
             self.batch_norms[f'l_{i}'] = nnx.BatchNorm(hidden_dim, rngs=rngs)
         
         # MLP to predict residual loss increases for each token position
         self.residual_mlp = MLP([hidden_dim, hidden_dim * 2, max_tokens], rngs=rngs)
     
-    def __call__(self, image_tokens: jnp.ndarray, training: bool = True) -> jnp.ndarray:
+    def __call__(self, image_tokens: jnp.ndarray) -> jnp.ndarray:
         """
         Args:
             image_tokens: [batch_size, seq_len, embed_dim] - image tokens
@@ -100,20 +101,16 @@ class TokenCountValueFunction(nnx.Module):
         x = image_tokens
         bn_idx = 0
         for i in range(self.num_layers):
-            attn_layer = self.transformer_layers[f'l_{i}']
+            attn_layer = self.transformer_layers[f'a_{i}']
             mlp_layer = self.transformer_layers[f'l_{i}']
             
             # Self-attention
-            x = attn_layer(x, training=training)
-            x = self.batch_norms[f'l_{i}'](x, training=training)
-            x = nnx.relu(x)
-            bn_idx += 1
+            x = attn_layer(x)
+            x = self.batch_norms[f'a_{i}'](x)
             
             # MLP
-            x = mlp_layer(x, training=training)
-            x = self.batch_norms[f'l_{i}'](x, training=training)
-            x = nnx.relu(x)
-            bn_idx += 1
+            x = mlp_layer(x)
+            x = self.batch_norms[f'l_{i}'](x)
         
         # Elementwise max over all tokens
         x_max = jnp.max(x, axis=1)  # [batch_size, hidden_dim]
@@ -127,26 +124,27 @@ class TokenCountValueFunction(nnx.Module):
         return predicted_losses
 
 
-class AdaptiveTokenFilter(nn.Module):
+class AdaptiveTokenFilter(nnx.Module):
     """Adaptive token filter with learnable k using Gumbel-Softmax top-k and value function"""
-    hidden_dim: int = 64
-    max_tokens: int = 256
-    use_value_function: bool = True
-    random_k_prob: float = 1.0  # Probability of using random k selection
-    random_k_decay: float = 0.99  # Decay rate for random k probability
-
-    def setup(self):
-        self.scorer = nn.Sequential([
-            nn.Dense(self.hidden_dim, dtype=jnp.float32),
-            nn.relu,
-            nn.Dense(1, dtype=jnp.float32),
-        ])
+    
+    def __init__(self, input_dim: int = 64, hidden_dim: int = 64, max_tokens: int = 256, *, rngs: nnx.Rngs):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.max_tokens = max_tokens
+        self.use_value_function = True
+        self.random_k_prob = 1.0  # Probability of using random k selection
+        self.random_k_decay = 0.99  # Decay rate for random k probability
+        
+        # Create scorer using NNX layers
+        self.scorer_layer1 = nnx.Linear(input_dim, self.hidden_dim, dtype=jnp.float32, rngs=rngs)
+        self.scorer_layer2 = nnx.Linear(self.hidden_dim, 1, dtype=jnp.float32, rngs=rngs)
+        
         self.value_function = TokenCountValueFunction(
-            max_tokens= 256,
-            hidden_dim= self.hidden_dim,
-            num_layers= 2,
-            num_heads= 4,
-            rngs= rngs
+            max_tokens=max_tokens,
+            hidden_dim=input_dim,
+            num_layers=2,
+            num_heads=4,
+            rngs=rngs
         )
                 
     def set_random_k_prob(self, prob: float):
@@ -172,7 +170,9 @@ class AdaptiveTokenFilter(nn.Module):
         batch_size, seq_len, embed_dim = token_embeddings.shape
         
         # Score each token's importance
-        importance_logits = self.scorer(token_embeddings).squeeze(-1)  # [batch, seq_len]
+        x = self.scorer_layer1(token_embeddings)
+        x = nnx.relu(x)
+        importance_logits = self.scorer_layer2(x).squeeze(-1)  # [batch, seq_len]
         
         if training and rng is not None:
             rng, rng2, rng3 = jax.random.split(rng, 3)
@@ -185,13 +185,13 @@ class AdaptiveTokenFilter(nn.Module):
             # Use value function to predict optimal k for each image
             current_random_prob = self.random_k_prob * (self.random_k_decay ** step)
             use_random = jax.random.bernoulli(rng3, current_random_prob)
+
+            def random_k_branch():
+                """Random k selection for exploration"""
+                return jax.random.uniform(rng3, (batch_size,), minval=1, maxval=seq_len).astype(jnp.int32)
             
-            if use_random:
-                # Random k selection for exploration
-                expected_k = jax.random.uniform(rng3, (batch_size,), minval=1, maxval=seq_len)
-            else:
-                # Get predicted losses for all token counts
-                predicted_losses = self.value_function(token_embeddings, training=training)  # [batch_size, max_tokens]
+            def value_function_branch():
+                """Get predicted losses for all token counts"""
                 
                 # Normalize losses between 0 and 1 for each image
                 min_losses = jnp.min(predicted_losses, axis=-1, keepdims=True)  # [batch_size, 1]
@@ -202,6 +202,14 @@ class AdaptiveTokenFilter(nn.Module):
                 loss_mask = normalized_losses <= 0.2
                 expected_k = jnp.argmax(loss_mask.astype(jnp.int32), axis=-1) + 1
                 expected_k = jnp.clip(expected_k, 1, seq_len)
+                return expected_k
+            
+            predicted_losses = self.value_function(token_embeddings)  # [batch_size, max_tokens]
+            expected_k = lax.cond(
+                use_random,
+                random_k_branch,
+                value_function_branch
+            )
         else:
             # Fallback to original method
             expected_k = nn.sigmoid(importance_logits).sum(axis=-1)
@@ -220,7 +228,6 @@ class AdaptiveTokenFilter(nn.Module):
             "selection_mask": selection_mask,  # Pass selection mask for loss calculation
         }
         
-        breakpoint()
         if self.use_value_function and self.value_function is not None and training:
             current_random_prob = self.random_k_prob * (self.random_k_decay ** step)
             info["random_k_prob"] = current_random_prob
@@ -230,8 +237,7 @@ class AdaptiveTokenFilter(nn.Module):
             if predicted_losses is not None:
                 info["predicted_losses"] = predicted_losses
             
-            # Log distribution occasionally
-            if step % 100 == 0 and predicted_losses is not None:
+            def value_function_distribution_branch():
                 # Sample one image for distribution logging
                 sample_idx = jax.random.randint(rng3, (), 0, batch_size)
                 sample_predicted = predicted_losses[sample_idx]  # [max_tokens]
@@ -241,12 +247,26 @@ class AdaptiveTokenFilter(nn.Module):
                 max_loss = jnp.max(sample_predicted)
                 normalized_losses = (sample_predicted - min_loss) / (max_loss - min_loss + 1e-8)
                 
-                token_counts = jnp.arange(1, min(seq_len + 1, self.max_tokens + 1))
-                
-                info["value_function_distribution"] = {
-                    "token_counts": token_counts,
-                    "predicted_losses": sample_predicted[:len(token_counts)],
-                    "normalized_losses": normalized_losses[:len(token_counts)]
+                value_info = {
+                    "value_function_distribution": {
+                        "predicted_losses": sample_predicted,
+                        "normalized_losses": normalized_losses,
+                        "populated": True
+                    },
                 }
+                return value_info
+            
+            # Log distribution occasionally
+            info |= lax.cond(
+                predicted_losses is not None,
+                value_function_distribution_branch,
+                lambda: {
+                    "value_function_distribution": {
+                        "predicted_losses": jnp.zeros((self.max_tokens,)),
+                        "normalized_losses": jnp.zeros((self.max_tokens,)),
+                        "populated": False
+                    }
+                }
+            )
         
         return filtered_embeddings, selection_mask, expected_k, info
