@@ -99,7 +99,6 @@ class TokenCountValueFunction(nnx.Module):
         
         # Apply transformer layers with batch normalization
         x = image_tokens
-        bn_idx = 0
         for i in range(self.num_layers):
             attn_layer = self.transformer_layers[f'a_{i}']
             mlp_layer = self.transformer_layers[f'l_{i}']
@@ -117,6 +116,7 @@ class TokenCountValueFunction(nnx.Module):
         
         # Predict residual loss increases for each token position
         residual_losses = self.residual_mlp(x_max).clip(0)  # [batch_size, max_tokens]
+        breakpoint()
         
         # Apply cumulative sum to get predicted losses for each token count
         predicted_losses = jnp.cumsum(residual_losses, axis=-1)  # [batch_size, max_tokens]
@@ -133,7 +133,7 @@ class AdaptiveTokenFilter(nnx.Module):
         self.max_tokens = max_tokens
         self.use_value_function = True
         self.random_k_prob = 1.0  # Probability of using random k selection
-        self.random_k_decay = 0.99  # Decay rate for random k probability
+        self.random_k_decay = 0.9999  # Decay rate for random k probability
         
         # Create scorer using NNX layers
         self.scorer_layer1 = nnx.Linear(input_dim, self.hidden_dim, dtype=jnp.float32, rngs=rngs)
@@ -199,12 +199,12 @@ class AdaptiveTokenFilter(nnx.Module):
                 normalized_losses = (predicted_losses - min_losses) / (max_losses - min_losses + 1e-8)
                 
                 # Find first k where normalized loss <= 0.2 for each image
-                loss_mask = normalized_losses <= 0.2
+                loss_mask = normalized_losses >= 0.2
                 expected_k = jnp.argmax(loss_mask.astype(jnp.int32), axis=-1) + 1
                 expected_k = jnp.clip(expected_k, 1, seq_len)
                 return expected_k
             
-            predicted_losses = self.value_function(token_embeddings)  # [batch_size, max_tokens]
+            predicted_losses = self.value_function(token_embeddings).clip(0, 1)  # [batch_size, max_tokens]
             expected_k = lax.cond(
                 use_random,
                 random_k_branch,
