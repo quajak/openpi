@@ -307,13 +307,17 @@ class Pi0(_model.BaseModel):
                 
                 predicted_losses = info["predicted_losses"]  # [batch_size, max_tokens]
                 
-                # Get predicted loss for actual token counts
+                # Get predicted loss matching the actual number of tokens REMOVED.
+                # "predicted_losses" is cumulative over removal steps; index 0 should correspond to no removals (0 loss).
                 batch_size = actual_token_counts.shape[0]
-                predicted_loss_for_counts = jnp.zeros(batch_size)
-                
-                for i in range(batch_size):
-                    token_count = actual_token_counts[i].astype(jnp.int32)
-                    predicted_loss_for_counts = predicted_loss_for_counts.at[i].set(predicted_losses[i, token_count - 1])
+                seq_len = info["image_selection_masks"].shape[1]
+                removed_counts = jnp.clip(seq_len - actual_token_counts, 0, seq_len).astype(jnp.int32)
+                predicted_losses_padded = jnp.concatenate(
+                    [jnp.zeros((batch_size, 1), dtype=predicted_losses.dtype), predicted_losses],
+                    axis=1,
+                )
+                safe_indices = jnp.clip(removed_counts, 0, predicted_losses_padded.shape[1] - 1)
+                predicted_loss_for_counts = predicted_losses_padded[jnp.arange(batch_size), safe_indices]
                 
                 # Value function loss: MSE between predicted and actual loss
                 actual_loss_detached = jax.lax.stop_gradient(base_loss)
