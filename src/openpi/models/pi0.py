@@ -304,6 +304,7 @@ class Pi0(_model.BaseModel):
                 self.training_step.value = self.training_step.value + 1
                 
                 actual_token_counts = jnp.sum(info["image_selection_masks"], axis=-1)  # [batch_size]
+                del info['image_selection_masks']
                 
                 predicted_losses = info["predicted_losses"]  # [batch_size, max_tokens]
                 
@@ -317,7 +318,7 @@ class Pi0(_model.BaseModel):
                 
                 # Value function loss: MSE between predicted and actual loss
                 actual_loss_detached = jax.lax.stop_gradient(base_loss)
-                value_function_loss = jnp.mean(jnp.square(predicted_loss_for_counts - actual_loss_detached.mean(-1)))
+                value_function_loss = jnp.mean(jnp.square(predicted_loss_for_counts - actual_loss_detached.mean(-1)))  # we need to take the mean here because the right term is per time step
                 self.value_function_loss.value = value_function_loss
                 
                 # Add value function loss to total loss
@@ -326,7 +327,7 @@ class Pi0(_model.BaseModel):
                 # Add value function metrics to info
                 info["value_function_loss"] = value_function_loss
                 info["value_function_predicted_loss"] = jnp.mean(predicted_loss_for_counts)
-                info["value_function_actual_loss"] = jnp.mean(actual_loss_detached)
+                info["prediction_loss"] = jnp.mean(actual_loss_detached)
                 info["training_step"] = self.training_step.value
             
             return total_loss, info
