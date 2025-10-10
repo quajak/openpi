@@ -163,8 +163,8 @@ class Pi0(_model.BaseModel):
                             'normalized_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
                             'populated': False
                         },
-                        'selection_mask': jnp.ones((image_tokens.shape[0], image_tokens.shape[1]), dtype=jnp.bool_),
-                        'predicted_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
+                        'selection_mask': jnp.ones((image_tokens.shape[0], image_tokens.shape[1]), dtype=jnp.float32),
+                        'predicted_losses': jnp.zeros((image_tokens.shape[0], image_tokens.shape[1],), dtype=jnp.float32),
                         } # No atf_info during warmup
                 
                 def non_warmup_case(image_tokens, image_mask):
