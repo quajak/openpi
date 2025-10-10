@@ -126,10 +126,11 @@ class TokenCountValueFunction(nnx.Module):
 class AdaptiveTokenFilter(nnx.Module):
     """Adaptive token filter with learnable k using Gumbel-Softmax top-k and value function"""
     
-    def __init__(self, input_dim: int = 64, hidden_dim: int = 64, max_tokens: int = 256, *, rngs: nnx.Rngs):
+    def __init__(self, input_dim: int = 64, hidden_dim: int = 64, max_tokens: int = 256, loss_threshold: float = 0.2, *, rngs: nnx.Rngs):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_tokens = max_tokens
+        self.loss_threshold = loss_threshold
         self.use_value_function = True
         self.random_k_prob = 1.0  # Probability of using random k selection
         self.random_k_decay = 0.9999  # Decay rate for random k probability
@@ -197,8 +198,8 @@ class AdaptiveTokenFilter(nnx.Module):
                 max_losses = jnp.max(predicted_losses, axis=-1, keepdims=True)  # [batch_size, 1]
                 normalized_losses = (predicted_losses - min_losses) / (max_losses - min_losses + 1e-8)
                 
-                # Find first k where normalized loss <= 0.2 for each image
-                loss_mask = normalized_losses >= 0.2
+                # Find first k where normalized loss <= threshold for each image
+                loss_mask = normalized_losses >= self.loss_threshold
                 expected_k = jnp.argmax(loss_mask.astype(jnp.int32), axis=-1) + 1
                 expected_k = jnp.clip(expected_k, 1, seq_len)
                 return expected_k

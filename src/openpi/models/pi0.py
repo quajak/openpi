@@ -72,6 +72,7 @@ class Pi0(_model.BaseModel):
         self.use_adaptive_token_filter = config.use_adaptive_token_filter
         self.atf_weight = config.atf_weight
         self.atf_tau = config.atf_tau
+        self.atf_warmup_steps = config.atf_warmup_steps
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -101,6 +102,7 @@ class Pi0(_model.BaseModel):
                 input_dim=paligemma_config.width,
                 hidden_dim=config.atf_hidden_dim, 
                 max_tokens=256,
+                loss_threshold=config.atf_loss_threshold,
                 rngs=rngs
             )
             
@@ -135,38 +137,56 @@ class Pi0(_model.BaseModel):
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
             if getattr(self, "use_adaptive_token_filter", False):
-                # Use training mode when model is non-deterministic
-                training = not self.deterministic
-                # Each camera shares the same filter parameters
-                filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
-                    image_tokens,
-                    tau=self.atf_tau,
-                    training=training,
-                    rng=rng if training else None,
-                    step=self.training_step.value,
-                )
-                image_tokens = filtered_embeddings
-                selection_mask_bool = selection_mask.astype(jnp.bool_)
-                valid_mask = einops.repeat(
-                    obs.image_masks[name],
-                    "b -> b s",
-                    s=selection_mask_bool.shape[1],
-                )
-
-                tokens.append(image_tokens)
-                input_mask.append(
-                    einops.repeat(
+                # Check if we're still in warmup period
+                in_warmup = self.training_step.value < self.atf_warmup_steps
+                
+                if not in_warmup:
+                    # Use training mode when model is non-deterministic
+                    training = not self.deterministic
+                    # Each camera shares the same filter parameters
+                    filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
+                        image_tokens,
+                        tau=self.atf_tau,
+                        training=training,
+                        rng=rng if training else None,
+                        step=self.training_step.value,
+                    )
+                    image_tokens = filtered_embeddings
+                    selection_mask_bool = selection_mask.astype(jnp.bool_)
+                    valid_mask = einops.repeat(
                         obs.image_masks[name],
                         "b -> b s",
-                        s=image_tokens.shape[1],
+                        s=selection_mask_bool.shape[1],
                     )
-                    #& selection_mask_bool
-                )
 
-                # Update running stats across all cameras
-                avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
-                avg_total_counts.append(jnp.sum(valid_mask))
-                avg_expected_ks.append(expected_k.mean())
+                    tokens.append(image_tokens)
+                    input_mask.append(
+                        einops.repeat(
+                            obs.image_masks[name],
+                            "b -> b s",
+                            s=image_tokens.shape[1],
+                        )
+                        #& selection_mask_bool
+                    )
+
+                    # Update running stats across all cameras
+                    avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
+                    avg_total_counts.append(jnp.sum(valid_mask))
+                    avg_expected_ks.append(expected_k.mean())
+                else:
+                    # During warmup, use all tokens without filtering
+                    tokens.append(image_tokens)
+                    input_mask.append(
+                        einops.repeat(
+                            obs.image_masks[name],
+                            "b -> b s",
+                            s=image_tokens.shape[1],
+                        )
+                    )
+                    # Set dummy values for metrics during warmup
+                    avg_kept_counts.append(jnp.sum(obs.image_masks[name]))
+                    avg_total_counts.append(jnp.sum(obs.image_masks[name]))
+                    avg_expected_ks.append(jnp.array(image_tokens.shape[1], dtype=jnp.float32))
             else:
                 tokens.append(image_tokens)
                 input_mask.append(
@@ -192,22 +212,24 @@ class Pi0(_model.BaseModel):
         # Store ATF monitoring variables
         info = {}
         if getattr(self, "use_adaptive_token_filter", False):
-            kept_frac = sum(avg_kept_counts)/sum(avg_total_counts)
+            in_warmup = self.training_step.value < self.atf_warmup_steps
+            
             # Persist stats for logging
-            info["atf_kept_frac"] = kept_frac.astype(jnp.float32)
-            info["atf_expected_k"] = jnp.asarray(avg_expected_ks, dtype=jnp.float32).mean()
+            info["atf_in_warmup"] = in_warmup.astype(jnp.bool_)
 
             for i, name in enumerate(obs.images):
                 info[f"per_camera_pruning/{name}/kept_frac"] = avg_kept_counts[i].astype(jnp.float32) / avg_total_counts[i].astype(jnp.float32)
                 info[f"per_camera_pruning/{name}/total_counts"] = avg_total_counts[i].astype(jnp.float32)
                 info[f"per_camera_pruning/{name}/expected_k"] = avg_expected_ks[i].astype(jnp.float32)
             
-            # Add value function metrics from the last ATF call
-            info |= atf_info
-            
-            # Store selection masks for loss calculation
-            if "selection_mask" in atf_info:
-                info["image_selection_masks"] = atf_info["selection_mask"]
+            # Add value function metrics from the last ATF call (only if not in warmup)
+            if not in_warmup and 'atf_info' in locals():
+                info |= atf_info
+                
+                # Store selection masks for loss calculation
+                if "selection_mask" in atf_info:
+                    info["image_selection_masks"] = atf_info["selection_mask"]
+                    del info['selection_mask']
         return tokens, input_mask, ar_mask, info
 
     @at.typecheck
@@ -288,6 +310,16 @@ class Pi0(_model.BaseModel):
         
         # Add adaptive token filter penalty normalized by number of cameras.
         if getattr(self, "use_adaptive_token_filter", False):
+            in_warmup = self.training_step.value < self.atf_warmup_steps
+            
+            if in_warmup:
+                # During warmup, just return base loss without any ATF penalties
+                if train:
+                    # Update training step
+                    self.training_step.value = self.training_step.value + 1
+                    info["training_step"] = self.training_step.value
+                return base_loss, info
+            
             # Check if we're using predicted loss function
             using_predicted_loss = train and "predicted_losses" in info
             

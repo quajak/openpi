@@ -266,6 +266,8 @@ def main(config: _config.TrainConfig):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             
+            del reduced_info
+            
             # Handle value function distribution logging
             log_info = {}
             for k, v in reduced_info.items():
@@ -282,8 +284,9 @@ def main(config: _config.TrainConfig):
                     ax2 = ax.twinx()
                     ax2.plot(x, v["normalized_losses"], 'r--', linewidth=2, label='Normalized Loss')
                     
-                    # Add 0.2 threshold line
-                    ax2.axhline(y=0.2, color='g', linestyle=':', linewidth=2, label='0.2 Threshold')
+                    # Add threshold line
+                    threshold = config.model.atf_loss_threshold
+                    ax2.axhline(y=threshold, color='g', linestyle=':', linewidth=2, label=f'{threshold} Threshold')
                     
                     ax.set_xlabel('Number of Tokens')
                     ax.set_ylabel('Predicted Loss', color='b')
@@ -303,12 +306,6 @@ def main(config: _config.TrainConfig):
             
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items() if k != "value_function_distribution")
             pbar.write(f"Step {step}: {info_str}")
-            
-            # Add additional wandb logging for value function metrics
-            if "atf/random_k_prob" in log_info:
-                wandb.log({"atf/random_k_prob_decay": log_info["atf/random_k_prob"]}, step=step)
-            if "atf/use_random_k" in log_info:
-                wandb.log({"atf/exploration_rate": float(log_info["atf/use_random_k"])}, step=step)
             
             wandb.log(log_info, step=step)
             infos = []
