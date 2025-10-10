@@ -135,90 +135,80 @@ class Pi0(_model.BaseModel):
         avg_total_counts = []
         avg_expected_ks = []
         for name in obs.images:
+            breakpoint()
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
-            if getattr(self, "use_adaptive_token_filter", False):
-                # Check if we're still in warmup period
-                in_warmup = self.training_step.value < self.atf_warmup_steps
-                
-                def warmup_case(image_tokens, image_mask):
-                    """During warmup, use all tokens without filtering"""
-                    tokens.append(image_tokens)
-                    input_mask.append(
-                        einops.repeat(
-                            image_mask,
-                            "b -> b s",
-                            s=image_tokens.shape[1],
-                        )
-                    )
-                    # Set dummy values for metrics during warmup
-                    avg_kept_counts.append(jnp.sum(image_mask))
-                    avg_total_counts.append(jnp.sum(image_mask))
-                    avg_expected_ks.append(jnp.array(image_tokens.shape[1], dtype=jnp.float32))
-                    return {
-                        'kept_fraction': jnp.array(1.0, dtype=jnp.float32),
-                        'expected_k': jnp.array(image_tokens.shape[1], dtype=jnp.float32),
-                        'random_k_prob': jnp.array(0.0, dtype=jnp.float32),
-                        'value_function_distribution': {
-                            'predicted_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
-                            'normalized_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
-                            'populated': False
-                        },
-                        'selection_mask': jnp.ones((image_tokens.shape[0], image_tokens.shape[1]), dtype=jnp.float32),
-                        'predicted_losses': jnp.zeros((image_tokens.shape[0], image_tokens.shape[1],), dtype=jnp.float32),
-                        } # No atf_info during warmup
-                
-                def non_warmup_case(image_tokens, image_mask):
-                    """Use training mode when model is non-deterministic"""
-                    training = not self.deterministic
-                    # Each camera shares the same filter parameters
-                    filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
-                        image_tokens,
-                        tau=self.atf_tau,
-                        training=training,
-                        rng=rng if training else None,
-                        step=self.training_step.value,
-                    )
-                    image_tokens = filtered_embeddings
-                    selection_mask_bool = selection_mask.astype(jnp.bool_)
-                    valid_mask = einops.repeat(
-                        image_mask,
-                        "b -> b s",
-                        s=selection_mask_bool.shape[1],
-                    )
-
-                    tokens.append(image_tokens)
-                    input_mask.append(
-                        einops.repeat(
-                            image_mask,
-                            "b -> b s",
-                            s=image_tokens.shape[1],
-                        )
-                        #& selection_mask_bool
-                    )
-
-                    # Update running stats across all cameras
-                    avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
-                    avg_total_counts.append(jnp.sum(valid_mask))
-                    avg_expected_ks.append(expected_k.mean())
-                    return atf_info
-                
-                # Use jax.lax.cond to choose between warmup and non-warmup cases
-                atf_info = jax.lax.cond(
-                    in_warmup,
-                    warmup_case,
-                    non_warmup_case,
-                    image_tokens,
-                    obs.image_masks[name]
-                )
-            else:
+            # Check if we're still in warmup period
+            in_warmup = self.training_step.value < self.atf_warmup_steps
+            
+            def warmup_case(image_tokens, image_mask):
+                """During warmup, use all tokens without filtering"""
                 tokens.append(image_tokens)
                 input_mask.append(
                     einops.repeat(
-                        obs.image_masks[name],
+                        image_mask,
                         "b -> b s",
                         s=image_tokens.shape[1],
                     )
                 )
+                # Set dummy values for metrics during warmup
+                avg_kept_counts.append(jnp.sum(image_mask))
+                avg_total_counts.append(jnp.sum(image_mask))
+                avg_expected_ks.append(jnp.array(image_tokens.shape[1], dtype=jnp.float32))
+                return {
+                    'kept_fraction': jnp.array(1.0, dtype=jnp.float32),
+                    'expected_k': jnp.array(image_tokens.shape[1], dtype=jnp.float32),
+                    'random_k_prob': jnp.array(0.0, dtype=jnp.float32),
+                    'value_function_distribution': {
+                        'predicted_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
+                        'normalized_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
+                        'populated': False
+                    },
+                    'selection_mask': jnp.ones((image_tokens.shape[0], image_tokens.shape[1]), dtype=jnp.float32),
+                    'predicted_losses': jnp.zeros((image_tokens.shape[0], image_tokens.shape[1],), dtype=jnp.float32),
+                    } # No atf_info during warmup
+            
+            def non_warmup_case(image_tokens, image_mask):
+                """Use training mode when model is non-deterministic"""
+                training = not self.deterministic
+                # Each camera shares the same filter parameters
+                filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
+                    image_tokens,
+                    tau=self.atf_tau,
+                    training=training,
+                    rng=rng if training else None,
+                    step=self.training_step.value,
+                )
+                selection_mask_bool = selection_mask.astype(jnp.bool_)
+                valid_mask = einops.repeat(
+                    image_mask,
+                    "b -> b s",
+                    s=selection_mask_bool.shape[1],
+                )
+
+                tokens.append(filtered_embeddings)
+                input_mask.append(
+                    einops.repeat(
+                        image_mask,
+                        "b -> b s",
+                        s=image_tokens.shape[1],
+                    )
+                    #& selection_mask_bool
+                )
+
+                # Update running stats across all cameras
+                avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
+                avg_total_counts.append(jnp.sum(valid_mask))
+                avg_expected_ks.append(expected_k.mean())
+                return atf_info
+            
+            # Use jax.lax.cond to choose between warmup and non-warmup cases
+            atf_info = jax.lax.cond(
+                jnp.logical_or(in_warmup, jnp.asarray(self.use_adaptive_token_filter, dtype=bool)),
+                warmup_case,
+                non_warmup_case,
+                image_tokens,
+                obs.image_masks[name]
+            )
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
@@ -246,7 +236,7 @@ class Pi0(_model.BaseModel):
                 info[f"per_camera_pruning/{name}/expected_k"] = avg_expected_ks[i].astype(jnp.float32)
             
             # Add value function metrics from the last ATF call (only if not in warmup)
-            if not in_warmup and atf_info is not None:
+            if atf_info is not None:
                 info |= atf_info
                 
                 # Store selection masks for loss calculation
