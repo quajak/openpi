@@ -10,7 +10,7 @@ This test creates a classification task where:
 import os
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
+import flax.nnx as nnx
 import optax
 from typing import Tuple, Dict, Any
 import matplotlib.pyplot as plt
@@ -43,50 +43,56 @@ def setup_gpu():
 device = setup_gpu()
 
 
-class ToyTransformer(nn.Module):
+class ToyTransformer(nnx.Module):
     """Small transformer for testing adaptive token filter."""
-    vocab_size: int
-    embed_dim: int
-    num_heads: int
-    num_layers: int
-    num_classes: int
-    max_seq_len: int
-    use_adaptive_filter: bool = True
-    filter_hidden_dim: int = 64
-    filter_max_k: int = 10
     
-    def setup(self):
-        self.embedding = nn.Embed(self.vocab_size, self.embed_dim)
-        self.pos_embedding = nn.Embed(self.max_seq_len, self.embed_dim)
+    def __init__(self, vocab_size: int, embed_dim: int, num_heads: int, num_layers: int, 
+                 num_classes: int, max_seq_len: int, use_adaptive_filter: bool = True,
+                 filter_hidden_dim: int = 64, filter_max_k: int = 10, *, rngs: nnx.Rngs):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.num_classes = num_classes
+        self.max_seq_len = max_seq_len
+        self.use_adaptive_filter = use_adaptive_filter
+        self.filter_hidden_dim = filter_hidden_dim
+        self.filter_max_k = filter_max_k
+        
+        self.embedding = nnx.Embed(self.vocab_size, self.embed_dim, rngs=rngs)
+        self.pos_embedding = nnx.Embed(self.max_seq_len, self.embed_dim, rngs=rngs)
         
         if self.use_adaptive_filter:
             self.token_filter = AdaptiveTokenFilter(
-                hidden_dim=self.filter_hidden_dim
+                input_dim=self.embed_dim,
+                hidden_dim=self.filter_hidden_dim,
+                max_tokens=self.filter_max_k,
+                rngs=rngs
             )
         
         # Transformer layers
-        self.transformer_layers = [
-            nn.MultiHeadDotProductAttention(
+        self.transformer_layers = {}
+        self.layer_norms = {}
+        self.mlp_layers = {}
+        for i in range(self.num_layers):
+            self.transformer_layers[f'attn_{i}'] = nnx.MultiHeadAttention(
                 num_heads=self.num_heads,
-                qkv_features=self.embed_dim,
-                out_features=self.embed_dim
+                in_features=self.embed_dim,
+                rngs=rngs,
+                decode=False
             )
-            for _ in range(self.num_layers)
-        ]
-        self.layer_norms = [nn.LayerNorm() for _ in range(self.num_layers)]
-        self.mlp_layers = [
-            nn.Sequential([
-                nn.Dense(self.embed_dim * 4),
-                nn.relu,
-                nn.Dense(self.embed_dim)
-            ]) for _ in range(self.num_layers)
-        ]
+            self.layer_norms[f'ln_{i}'] = nnx.LayerNorm(self.embed_dim, rngs=rngs)
+            
+            # MLP layers
+            self.mlp_layers[f'mlp1_{i}'] = nnx.Linear(self.embed_dim, self.embed_dim * 4, rngs=rngs)
+            self.mlp_layers[f'mlp2_{i}'] = nnx.Linear(self.embed_dim * 4, self.embed_dim, rngs=rngs)
         
         # Classification head
-        self.classifier = nn.Dense(self.num_classes)
+        self.classifier = nnx.Linear(self.embed_dim, self.num_classes, rngs=rngs)
     
     def __call__(self, tokens: jnp.ndarray, mask: jnp.ndarray, 
-                 training: bool = True, rng: jax.random.PRNGKey = None) -> Tuple[jnp.ndarray, Dict[str, Any]]:
+                 training: bool = True, rng: jax.random.PRNGKey = None) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, Any]]:
         """
         Args:
             tokens: [batch_size, seq_len] token indices
@@ -96,6 +102,7 @@ class ToyTransformer(nn.Module):
             
         Returns:
             logits: [batch_size, num_classes] classification logits
+            expected_k: [batch_size] expected number of tokens kept
             metrics: dict with filter statistics
         """
         assert rng is not None
@@ -112,13 +119,10 @@ class ToyTransformer(nn.Module):
         # Apply adaptive token filter if enabled
         if self.use_adaptive_filter:
             rng1, rng2 = jax.random.split(rng)
-            filtered_x, selection_mask, expected_k = self.token_filter(
-                x, tau=1.0, training=training, rng=rng2
+            filtered_x, selection_mask, expected_k, info = self.token_filter(
+                x, tau=1.0, training=training, rng=rng2, step=0
             )
             x = filtered_x
-            
-            # Update mask to include filter selection
-            # mask = mask & selection_mask.astype(jnp.bool_)
             
             # Calculate metrics directly (no state storage)
             kept_fraction = jnp.mean(selection_mask)
@@ -128,14 +132,15 @@ class ToyTransformer(nn.Module):
             kept_fraction = jnp.array(1.0)
         
         # Apply transformer layers
-        for i, (attn, layer_norm, mlp) in enumerate(zip(self.transformer_layers, self.layer_norms, self.mlp_layers)):
+        for i in range(self.num_layers):
             # Self-attention
-            attn_out = attn(x, mask=jnp.reshape(jnp.tile(mask, mask.shape[-1]*self.num_heads), (mask.shape[0], self.num_heads, mask.shape[1], mask.shape[1])))
-            x = layer_norm(x + attn_out)
+            attn_out = self.transformer_layers[f'attn_{i}'](x)
+            x = self.layer_norms[f'ln_{i}'](x + attn_out)
             
             # MLP
-            mlp_out = mlp(x)
-            x = layer_norm(x + mlp_out)
+            mlp_hidden = nnx.relu(self.mlp_layers[f'mlp1_{i}'](x))
+            mlp_out = self.mlp_layers[f'mlp2_{i}'](mlp_hidden)
+            x = self.layer_norms[f'ln_{i}'](x + mlp_out)
         
         # Global average pooling (masked)
         mask_expanded = mask[..., None]
@@ -207,36 +212,43 @@ def generate_toy_data(batch_size: int, seq_len: int, vocab_size: int,
     return tokens, labels, signal_tokens
 
 
-def create_model(config: Dict[str, Any], rng: jax.random.PRNGKey) -> Tuple[ToyTransformer, Dict[str, Any]]:
+def create_model(config: Dict[str, Any], rng: jax.random.PRNGKey) -> Tuple[ToyTransformer, nnx.State]:
     """Create and initialize the model."""
-    model = ToyTransformer(**config)
+    rngs = nnx.Rngs(rng)
+    model = ToyTransformer(**config, rngs=rngs)
     
     # Initialize with dummy data on the correct device
     dummy_tokens = jax.device_put(jnp.zeros((1, config['max_seq_len']), dtype=jnp.int32), device)
     dummy_mask = jax.device_put(jnp.ones((1, config['max_seq_len']), dtype=jnp.bool_), device)
     
-    params = model.init(rng, dummy_tokens, dummy_mask, training=True, rng=rng)
+    # Initialize the model by calling it
+    model(dummy_tokens, dummy_mask, training=True, rng=rng)
     
-    return model, params
+    # Get the state
+    state = nnx.state(model)
+    
+    return model, state
 
 
-def train_step(model: ToyTransformer, params: Dict[str, Any], 
+def train_step(model: ToyTransformer, state: nnx.State, 
                tokens: jnp.ndarray, labels: jnp.ndarray, mask: jnp.ndarray,
                optimizer: optax.GradientTransformation, opt_state: Any,
-               rng: jax.random.PRNGKey) -> Tuple[Dict[str, Any], Any, Dict[str, Any]]:
+               rng: jax.random.PRNGKey) -> Tuple[nnx.State, Any, Dict[str, Any]]:
     """Single training step."""
     
-    def loss_fn(params):
-        logits, expected_k, metrics = model.apply(params, tokens, mask, training=True, rng=rng)
+    def loss_fn(state):
+        # Update model state
+        nnx.update(model, state)
+        logits, expected_k, metrics = model(tokens, mask, training=True, rng=rng)
         task_loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
         metrics['task_loss'] = task_loss
         metrics['expected_k_loss'] = 0.0001 * expected_k.mean()
         loss = task_loss + 0.0001 * expected_k.mean()
         return loss, (logits, metrics)
     
-    (loss, (logits, metrics)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = optax.apply_updates(params, updates)
+    (loss, (logits, metrics)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state)
+    updates, opt_state = optimizer.update(grads, opt_state, state)
+    state = optax.apply_updates(state, updates)
     
     # Compute accuracy
     predictions = jnp.argmax(logits, axis=-1)
@@ -247,17 +259,19 @@ def train_step(model: ToyTransformer, params: Dict[str, Any],
         'accuracy': accuracy
     })
     
-    return params, opt_state, metrics
+    return state, opt_state, metrics
 
 
 # JIT compile the training step for better GPU performance
 train_step_jit = jax.jit(train_step, static_argnums=(0, 5))
 
 
-def evaluate(model: ToyTransformer, params: Dict[str, Any],
+def evaluate(model: ToyTransformer, state: nnx.State,
              tokens: jnp.ndarray, labels: jnp.ndarray, mask: jnp.ndarray, rng: jax.random.PRNGKey) -> Dict[str, Any]:
     """Evaluate the model."""
-    logits, expected_k, metrics = model.apply(params, tokens, mask, training=False, rng=rng)
+    # Update model state
+    nnx.update(model, state)
+    logits, expected_k, metrics = model(tokens, mask, training=False, rng=rng)
     
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
     predictions = jnp.argmax(logits, axis=-1)
@@ -332,7 +346,7 @@ def main():
     
     # Create model
     rng = jax.random.PRNGKey(0)
-    model, params = create_model(config, rng)
+    model, state = create_model(config, rng)
     
     # Generate data
     print("Generating synthetic data...")
@@ -347,7 +361,7 @@ def main():
     
     # Create optimizer
     optimizer = optax.adam(learning_rate)
-    opt_state = optimizer.init(params)
+    opt_state = optimizer.init(state)
     
     # Training loop
     print("Starting training...")
@@ -370,8 +384,9 @@ def main():
             batch_mask = train_mask[i:i+batch_size]
             
             step_rng, rng = jax.random.split(rng)
-            params, opt_state, metrics = train_step_jit(
-                model, params, batch_tokens, batch_labels, batch_mask, 
+            # state, opt_state, metrics = train_step_jit(
+            state, opt_state, metrics = train_step(
+                model, state, batch_tokens, batch_labels, batch_mask, 
                 optimizer, opt_state, step_rng
             )
             epoch_metrics.append(metrics)
@@ -381,7 +396,7 @@ def main():
         
         # Validation
         eval_rng, rng = jax.random.split(rng)
-        val_metrics = evaluate_jit(model, params, val_tokens, val_labels, val_mask, eval_rng)
+        val_metrics = evaluate_jit(model, state, val_tokens, val_labels, val_mask, eval_rng)
         
         if epoch % 10 == 0:
             print(f"Epoch {epoch:3d}: "
@@ -397,14 +412,15 @@ def main():
     # Final evaluation with token selection visualization
     print("\nFinal evaluation...")
     eval_rng, rng = jax.random.split(rng)
-    final_metrics = evaluate_jit(model, params, val_tokens, val_labels, val_mask, eval_rng)
+    final_metrics = evaluate_jit(model, state, val_tokens, val_labels, val_mask, eval_rng)
     print(f"Final validation accuracy: {final_metrics['accuracy']:.4f}")
     print(f"Final expected K: {final_metrics['expected_k'].item():.2f}")
     print(f"Final kept fraction: {final_metrics['kept_fraction']:.3f}")
     
     # Get token selection for visualization
     eval_rng, rng = jax.random.split(rng)
-    logits, expected_k, metrics = model.apply(params, val_tokens[:1], val_mask[:1], training=False, rng=eval_rng)
+    nnx.update(model, state)
+    logits, expected_k, metrics = model(val_tokens[:1], val_mask[:1], training=False, rng=eval_rng)
     predictions = jnp.argmax(logits, axis=-1)
     
     # Note: In evaluation mode, we don't get selection masks, so we'll use signal masks for demo

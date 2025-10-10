@@ -140,8 +140,35 @@ class Pi0(_model.BaseModel):
                 # Check if we're still in warmup period
                 in_warmup = self.training_step.value < self.atf_warmup_steps
                 
-                if not in_warmup:
-                    # Use training mode when model is non-deterministic
+                def warmup_case(image_tokens, image_mask):
+                    """During warmup, use all tokens without filtering"""
+                    tokens.append(image_tokens)
+                    input_mask.append(
+                        einops.repeat(
+                            image_mask,
+                            "b -> b s",
+                            s=image_tokens.shape[1],
+                        )
+                    )
+                    # Set dummy values for metrics during warmup
+                    avg_kept_counts.append(jnp.sum(image_mask))
+                    avg_total_counts.append(jnp.sum(image_mask))
+                    avg_expected_ks.append(jnp.array(image_tokens.shape[1], dtype=jnp.float32))
+                    return {
+                        'kept_fraction': jnp.array(1.0, dtype=jnp.float32),
+                        'expected_k': jnp.array(image_tokens.shape[1], dtype=jnp.float32),
+                        'random_k_prob': jnp.array(0.0, dtype=jnp.float32),
+                        'value_function_distribution': {
+                            'predicted_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
+                            'normalized_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
+                            'populated': False
+                        },
+                        'selection_mask': jnp.ones((image_tokens.shape[0], image_tokens.shape[1]), dtype=jnp.bool_),
+                        'predicted_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
+                        } # No atf_info during warmup
+                
+                def non_warmup_case(image_tokens, image_mask):
+                    """Use training mode when model is non-deterministic"""
                     training = not self.deterministic
                     # Each camera shares the same filter parameters
                     filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
@@ -154,7 +181,7 @@ class Pi0(_model.BaseModel):
                     image_tokens = filtered_embeddings
                     selection_mask_bool = selection_mask.astype(jnp.bool_)
                     valid_mask = einops.repeat(
-                        obs.image_masks[name],
+                        image_mask,
                         "b -> b s",
                         s=selection_mask_bool.shape[1],
                     )
@@ -162,7 +189,7 @@ class Pi0(_model.BaseModel):
                     tokens.append(image_tokens)
                     input_mask.append(
                         einops.repeat(
-                            obs.image_masks[name],
+                            image_mask,
                             "b -> b s",
                             s=image_tokens.shape[1],
                         )
@@ -173,20 +200,16 @@ class Pi0(_model.BaseModel):
                     avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
                     avg_total_counts.append(jnp.sum(valid_mask))
                     avg_expected_ks.append(expected_k.mean())
-                else:
-                    # During warmup, use all tokens without filtering
-                    tokens.append(image_tokens)
-                    input_mask.append(
-                        einops.repeat(
-                            obs.image_masks[name],
-                            "b -> b s",
-                            s=image_tokens.shape[1],
-                        )
-                    )
-                    # Set dummy values for metrics during warmup
-                    avg_kept_counts.append(jnp.sum(obs.image_masks[name]))
-                    avg_total_counts.append(jnp.sum(obs.image_masks[name]))
-                    avg_expected_ks.append(jnp.array(image_tokens.shape[1], dtype=jnp.float32))
+                    return atf_info
+                
+                # Use jax.lax.cond to choose between warmup and non-warmup cases
+                atf_info = jax.lax.cond(
+                    in_warmup,
+                    warmup_case,
+                    non_warmup_case,
+                    image_tokens,
+                    obs.image_masks[name]
+                )
             else:
                 tokens.append(image_tokens)
                 input_mask.append(
@@ -223,7 +246,7 @@ class Pi0(_model.BaseModel):
                 info[f"per_camera_pruning/{name}/expected_k"] = avg_expected_ks[i].astype(jnp.float32)
             
             # Add value function metrics from the last ATF call (only if not in warmup)
-            if not in_warmup and 'atf_info' in locals():
+            if not in_warmup and atf_info is not None:
                 info |= atf_info
                 
                 # Store selection masks for loss calculation
