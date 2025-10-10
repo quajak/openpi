@@ -4,7 +4,7 @@ import dataclasses
 import enum
 import logging
 import pathlib
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, Any
 
 import augmax
 from flax import nnx
