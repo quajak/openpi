@@ -142,19 +142,16 @@ class Pi0(_model.BaseModel):
                 
                 def warmup_case(image_tokens, image_mask):
                     """During warmup, use all tokens without filtering"""
-                    tokens.append(image_tokens)
-                    input_mask.append(
-                        einops.repeat(
+                    this_input_mask = einops.repeat(
                             image_mask,
                             "b -> b s",
                             s=image_tokens.shape[1],
                         )
-                    )
                     # Set dummy values for metrics during warmup
                     avg_kept_counts.append(jnp.sum(image_mask))
                     avg_total_counts.append(jnp.sum(image_mask))
                     avg_expected_ks.append(jnp.array(image_tokens.shape[1], dtype=jnp.float32))
-                    return {
+                    return image_tokens, this_input_mask, {
                         'kept_fraction': jnp.array(1.0, dtype=jnp.float32),
                         'expected_k': jnp.array(image_tokens.shape[1], dtype=jnp.float32),
                         'random_k_prob': jnp.array(0.0, dtype=jnp.float32),
@@ -178,7 +175,6 @@ class Pi0(_model.BaseModel):
                         rng=rng if training else None,
                         step=self.training_step.value,
                     )
-                    image_tokens = filtered_embeddings
                     selection_mask_bool = selection_mask.astype(jnp.bool_)
                     valid_mask = einops.repeat(
                         image_mask,
@@ -186,30 +182,28 @@ class Pi0(_model.BaseModel):
                         s=selection_mask_bool.shape[1],
                     )
 
-                    tokens.append(image_tokens)
-                    input_mask.append(
-                        einops.repeat(
+                    this_input_mask = einops.repeat(
                             image_mask,
                             "b -> b s",
                             s=image_tokens.shape[1],
                         )
-                        #& selection_mask_bool
-                    )
 
                     # Update running stats across all cameras
                     avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
                     avg_total_counts.append(jnp.sum(valid_mask))
                     avg_expected_ks.append(expected_k.mean())
-                    return atf_info
+                    return filtered_embeddings, this_input_mask, atf_info
                 
                 # Use jax.lax.cond to choose between warmup and non-warmup cases
-                atf_info = jax.lax.cond(
+                new_image_tokens, new_input_mask, atf_info = jax.lax.cond(
                     in_warmup,
                     warmup_case,
                     non_warmup_case,
                     image_tokens,
                     obs.image_masks[name]
                 )
+                tokens.append(new_image_tokens)
+                input_mask.append(new_input_mask)
             else:
                 tokens.append(image_tokens)
                 input_mask.append(
