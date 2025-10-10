@@ -115,7 +115,7 @@ class TokenCountValueFunction(nnx.Module):
         x_max = jnp.max(x, axis=1)  # [batch_size, hidden_dim]
         
         # Predict residual loss increases for each token position
-        residual_losses = self.residual_mlp(x_max).clip(0)  # [batch_size, max_tokens]
+        residual_losses = jax.nn.sigmoid(self.residual_mlp(x_max)) / (x_max.shape[1]//2)  # [batch_size, max_tokens]
         
         # Apply cumulative sum to get predicted losses for each token count
         predicted_losses = jnp.cumsum(residual_losses, axis=-1)  # [batch_size, max_tokens]
@@ -204,7 +204,7 @@ class AdaptiveTokenFilter(nnx.Module):
                 expected_k = jnp.clip(expected_k, 1, seq_len)
                 return expected_k
             
-            predicted_losses = self.value_function(token_embeddings).clip(0, 1)  # [batch_size, max_tokens]
+            predicted_losses = self.value_function(token_embeddings)  # [batch_size, max_tokens]
             expected_k = lax.cond(
                 use_random,
                 random_k_branch,

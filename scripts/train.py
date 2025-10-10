@@ -306,6 +306,37 @@ def main(config: _config.TrainConfig):
             
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items() if k != "value_function_distribution")
             pbar.write(f"Step {step}: {info_str}")
+
+            if "value_function_distribution" in stacked_infos:
+                v = stacked_infos['value_function_distribution']
+                if len(v['predicted_losses'].shape) == 0:
+                    continue
+                # Log the distribution as a wandb plot
+                fig, ax = plt.subplots(figsize=(12, 8))
+                
+                # Plot both raw and normalized losses
+                length = len(v["predicted_losses"][0])
+                x = jnp.arange(1, length + 1)
+                ax.plot(x, v["predicted_losses"][0], 'b-', linewidth=2, label='Predicted Loss')
+                ax2 = ax.twinx()
+                ax2.plot(x, v["normalized_losses"][0], 'r--', linewidth=2, label='Normalized Loss')
+                
+                # Add 0.2 threshold line
+                ax2.axhline(y=0.2, color='g', linestyle=':', linewidth=2, label='0.2 Threshold')
+                
+                ax.set_xlabel('Number of Tokens')
+                ax.set_ylabel('Predicted Loss', color='b')
+                ax2.set_ylabel('Normalized Loss', color='r')
+                ax.set_title('Value Function: Token Count vs Predicted Loss')
+                ax.grid(True, alpha=0.3)
+                
+                # Combine legends
+                lines1, labels1 = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+                
+                log_info["value_function_distribution_plot"] = wandb.Image(fig)
+                plt.close(fig)
             
             wandb.log(log_info, step=step)
             infos = []
