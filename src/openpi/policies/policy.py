@@ -89,10 +89,24 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        sample_result = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        
+        # Handle both old and new return types from sample_actions
+        if isinstance(sample_result, tuple):
+            actions, model_info = sample_result
+        else:
+            actions = sample_result
+            model_info = {}
+            
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
+        
+        # Add model info (including ATF info) to outputs if available
+        if model_info:
+            outputs["model_info"] = model_info
+            
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

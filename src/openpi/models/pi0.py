@@ -308,13 +308,17 @@ class Pi0(_model.BaseModel):
                 
                 predicted_losses = info["predicted_losses"]  # [batch_size, max_tokens]
                 
-                # Get predicted loss for actual token counts
+                # Get predicted loss matching the actual number of tokens REMOVED.
+                # "predicted_losses" is cumulative over removal steps; index 0 should correspond to no removals (0 loss).
                 batch_size = actual_token_counts.shape[0]
-                predicted_loss_for_counts = jnp.zeros(batch_size)
-                
-                for i in range(batch_size):
-                    token_count = actual_token_counts[i].astype(jnp.int32)
-                    predicted_loss_for_counts = predicted_loss_for_counts.at[i].set(predicted_losses[i, token_count - 1])
+                seq_len = info["image_selection_masks"].shape[1]
+                removed_counts = jnp.clip(seq_len - actual_token_counts, 0, seq_len).astype(jnp.int32)
+                predicted_losses_padded = jnp.concatenate(
+                    [jnp.zeros((batch_size, 1), dtype=predicted_losses.dtype), predicted_losses],
+                    axis=1,
+                )
+                safe_indices = jnp.clip(removed_counts, 0, predicted_losses_padded.shape[1] - 1)
+                predicted_loss_for_counts = predicted_losses_padded[jnp.arange(batch_size), safe_indices]
                 
                 # Value function loss: MSE between predicted and actual loss
                 actual_loss_detached = jax.lax.stop_gradient(base_loss)
@@ -341,7 +345,7 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
-    ) -> _model.Actions:
+    ) -> tuple[_model.Actions, dict[str, Any]]:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -351,7 +355,7 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask, _ = self.embed_prefix(observation, rng=None)
+        prefix_tokens, prefix_mask, prefix_ar_mask, atf_info = self.embed_prefix(observation, rng=None)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
@@ -396,4 +400,4 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0
+        return x_0, atf_info
