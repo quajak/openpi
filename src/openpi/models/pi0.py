@@ -119,54 +119,6 @@ class Pi0(_model.BaseModel):
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
-    def warmup_case(self, image_tokens, image_mask, rng):
-        """During warmup, use all tokens without filtering"""
-        this_input_mask = einops.repeat(
-                image_mask,
-                "b -> b s",
-                s=image_tokens.shape[1],
-            )
-        # Set dummy values for metrics during warmup
-        return image_tokens, this_input_mask, jnp.array(0.0, dtype=jnp.int32), {
-            'kept_fraction': jnp.array(1.0, dtype=jnp.float32),
-            'expected_k': jnp.array(image_tokens.shape[1], dtype=jnp.float32),
-            'random_k_prob': jnp.array(0.0, dtype=jnp.float32),
-            'value_function_distribution': {
-                'predicted_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
-                'normalized_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
-                'populated': False
-            },
-            'selection_mask': jnp.ones((image_tokens.shape[0], image_tokens.shape[1]), dtype=jnp.float32),
-            'predicted_losses': jnp.zeros((image_tokens.shape[0], image_tokens.shape[1],), dtype=jnp.float32),
-            } # No atf_info during warmup
-    
-    def non_warmup_case(self, image_tokens, image_mask, rng):
-        """Use training mode when model is non-deterministic"""
-        training = not self.deterministic
-        # Each camera shares the same filter parameters
-        filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
-            image_tokens,
-            tau=self.atf_tau,
-            training=training,
-            rng=rng if training else None,
-            step=self.training_step.value,
-        )
-        selection_mask_bool = selection_mask.astype(jnp.bool_)
-
-        valid_mask = einops.repeat(
-            image_mask,
-            "b -> b s",
-            s=image_tokens.shape[1],
-        )
-
-        this_input_mask = einops.repeat(
-                image_mask,
-                "b -> b s",
-                s=image_tokens.shape[1],
-            )
-
-        return filtered_embeddings.astype(image_tokens.dtype), this_input_mask, jnp.sum(selection_mask_bool * valid_mask), atf_info
-
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation, rng: at.KeyArrayLike | None = None
@@ -182,14 +134,23 @@ class Pi0(_model.BaseModel):
             in_warmup = self.training_step.value < self.atf_warmup_steps
         
             if self.use_adaptive_token_filter:
-                new_image_tokens, new_input_mask, new_kept_counts, atf_info = jax.lax.cond(
-                    jnp.logical_or(in_warmup, jnp.asarray(self.use_adaptive_token_filter, dtype=bool)),
-                    self.warmup_case,
-                    self.non_warmup_case,
+                training = not self.deterministic
+                # Each camera shares the same filter parameters
+                filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
                     image_tokens,
-                    obs.image_masks[name],
-                    rng
+                    tau=self.atf_tau,
+                    training=training,
+                    rng=rng if training else None,
+                    step=self.training_step.value,
                 )
+                new_input_mask = einops.repeat(
+                        obs.image_masks[name],
+                        "b -> b s",
+                        s=image_tokens.shape[1],
+                    )
+
+                new_image_tokens = (1 - in_warmup) * filtered_embeddings.astype(image_tokens.dtype) + in_warmup * image_tokens
+                new_kept_counts = jnp.sum(selection_mask)
             else:
                 new_image_tokens = image_tokens
                 new_input_mask = einops.repeat(
