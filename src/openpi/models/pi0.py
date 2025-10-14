@@ -96,6 +96,7 @@ class Pi0(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
 
+        self.training_step = nnx.Variable(jnp.array(0, dtype=jnp.int32))
         # Shared adaptive token filter across all cameras.
         if self.use_adaptive_token_filter:
             self.AdaptiveTokenFilter = _AdaptiveTokenFilter(
@@ -105,11 +106,6 @@ class Pi0(_model.BaseModel):
                 loss_threshold=config.atf_loss_threshold,
                 rngs=rngs
             )
-            
-            
-            # Stateful variables to expose metrics during training.
-            self.value_function_loss = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
-            self.training_step = nnx.Variable(jnp.array(0, dtype=jnp.int32))
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -123,6 +119,54 @@ class Pi0(_model.BaseModel):
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
+    def warmup_case(self, image_tokens, image_mask, rng):
+        """During warmup, use all tokens without filtering"""
+        this_input_mask = einops.repeat(
+                image_mask,
+                "b -> b s",
+                s=image_tokens.shape[1],
+            )
+        # Set dummy values for metrics during warmup
+        return image_tokens, this_input_mask, jnp.array(0.0, dtype=jnp.int32), {
+            'kept_fraction': jnp.array(1.0, dtype=jnp.float32),
+            'expected_k': jnp.array(image_tokens.shape[1], dtype=jnp.float32),
+            'random_k_prob': jnp.array(0.0, dtype=jnp.float32),
+            'value_function_distribution': {
+                'predicted_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
+                'normalized_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
+                'populated': False
+            },
+            'selection_mask': jnp.ones((image_tokens.shape[0], image_tokens.shape[1]), dtype=jnp.float32),
+            'predicted_losses': jnp.zeros((image_tokens.shape[0], image_tokens.shape[1],), dtype=jnp.float32),
+            } # No atf_info during warmup
+    
+    def non_warmup_case(self, image_tokens, image_mask, rng):
+        """Use training mode when model is non-deterministic"""
+        training = not self.deterministic
+        # Each camera shares the same filter parameters
+        filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
+            image_tokens,
+            tau=self.atf_tau,
+            training=training,
+            rng=rng if training else None,
+            step=self.training_step.value,
+        )
+        selection_mask_bool = selection_mask.astype(jnp.bool_)
+
+        valid_mask = einops.repeat(
+            image_mask,
+            "b -> b s",
+            s=image_tokens.shape[1],
+        )
+
+        this_input_mask = einops.repeat(
+                image_mask,
+                "b -> b s",
+                s=image_tokens.shape[1],
+            )
+
+        return filtered_embeddings.astype(image_tokens.dtype), this_input_mask, jnp.sum(selection_mask_bool * valid_mask), atf_info
+
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation, rng: at.KeyArrayLike | None = None
@@ -133,77 +177,33 @@ class Pi0(_model.BaseModel):
         # embed images
         avg_kept_counts = []
         avg_total_counts = []
-        avg_expected_ks = []
         for name in obs.images:
-            breakpoint()
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
-            # Check if we're still in warmup period
             in_warmup = self.training_step.value < self.atf_warmup_steps
-            
-            def warmup_case(image_tokens, image_mask):
-                """During warmup, use all tokens without filtering"""
-                this_input_mask = einops.repeat(
-                        image_mask,
-                        "b -> b s",
-                        s=image_tokens.shape[1],
-                    )
-                # Set dummy values for metrics during warmup
-                avg_kept_counts.append(jnp.sum(image_mask))
-                avg_total_counts.append(jnp.sum(image_mask))
-                avg_expected_ks.append(jnp.array(image_tokens.shape[1], dtype=jnp.float32))
-                return image_tokens, this_input_mask, {
-                    'kept_fraction': jnp.array(1.0, dtype=jnp.float32),
-                    'expected_k': jnp.array(image_tokens.shape[1], dtype=jnp.float32),
-                    'random_k_prob': jnp.array(0.0, dtype=jnp.float32),
-                    'value_function_distribution': {
-                        'predicted_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
-                        'normalized_losses': jnp.zeros((image_tokens.shape[1],), dtype=jnp.float32),
-                        'populated': False
-                    },
-                    'selection_mask': jnp.ones((image_tokens.shape[0], image_tokens.shape[1]), dtype=jnp.float32),
-                    'predicted_losses': jnp.zeros((image_tokens.shape[0], image_tokens.shape[1],), dtype=jnp.float32),
-                    } # No atf_info during warmup
-            
-            def non_warmup_case(image_tokens, image_mask):
-                """Use training mode when model is non-deterministic"""
-                training = not self.deterministic
-                # Each camera shares the same filter parameters
-                filtered_embeddings, selection_mask, expected_k, atf_info = self.AdaptiveTokenFilter(
+        
+            if self.use_adaptive_token_filter:
+                new_image_tokens, new_input_mask, new_kept_counts, atf_info = jax.lax.cond(
+                    jnp.logical_or(in_warmup, jnp.asarray(self.use_adaptive_token_filter, dtype=bool)),
+                    self.warmup_case,
+                    self.non_warmup_case,
                     image_tokens,
-                    tau=self.atf_tau,
-                    training=training,
-                    rng=rng if training else None,
-                    step=self.training_step.value,
+                    obs.image_masks[name],
+                    rng
                 )
-                selection_mask_bool = selection_mask.astype(jnp.bool_)
-                valid_mask = einops.repeat(
-                    image_mask,
+            else:
+                new_image_tokens = image_tokens
+                new_input_mask = einops.repeat(
+                    obs.image_masks[name],
                     "b -> b s",
-                    s=selection_mask_bool.shape[1],
+                    s=image_tokens.shape[1],
                 )
-
-                this_input_mask = einops.repeat(
-                        image_mask,
-                        "b -> b s",
-                        s=image_tokens.shape[1],
-                    )
-
-                # Update running stats across all cameras
-                avg_kept_counts.append(jnp.sum(selection_mask * valid_mask))
-                avg_total_counts.append(jnp.sum(valid_mask))
-                avg_expected_ks.append(expected_k.mean())
-                return filtered_embeddings, this_input_mask, atf_info
-            
-            # Use jax.lax.cond to choose between warmup and non-warmup cases
-            new_image_tokens, new_input_mask, atf_info = jax.lax.cond(
-                jnp.logical_or(in_warmup, jnp.asarray(self.use_adaptive_token_filter, dtype=bool)),
-                warmup_case,
-                non_warmup_case,
-                image_tokens,
-                obs.image_masks[name]
-            )
+                new_kept_counts = jnp.array(image_tokens.shape[1], dtype=jnp.int32)
+                atf_info = {}
             tokens.append(new_image_tokens)
             input_mask.append(new_input_mask)
+
+            avg_kept_counts.append(new_kept_counts)
+            avg_total_counts.append(new_input_mask.shape[1])
 
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
@@ -220,16 +220,15 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         # Store ATF monitoring variables
         info = {}
-        if getattr(self, "use_adaptive_token_filter", False):
+        if self.use_adaptive_token_filter:
             in_warmup = self.training_step.value < self.atf_warmup_steps
             
             # Persist stats for logging
             info["atf_in_warmup"] = in_warmup.astype(jnp.bool_)
 
             for i, name in enumerate(obs.images):
-                info[f"per_camera_pruning/{name}/kept_frac"] = avg_kept_counts[i].astype(jnp.float32) / avg_total_counts[i].astype(jnp.float32)
-                info[f"per_camera_pruning/{name}/total_counts"] = avg_total_counts[i].astype(jnp.float32)
-                info[f"per_camera_pruning/{name}/expected_k"] = avg_expected_ks[i].astype(jnp.float32)
+                info[f"per_camera_pruning/{name}/kept_frac"] = avg_kept_counts[i].astype(jnp.float32) / avg_total_counts[i]
+                info[f"per_camera_pruning/{name}/total_counts"] = avg_total_counts[i]
             
             # Add value function metrics from the last ATF call (only if not in warmup)
             if atf_info is not None:
@@ -290,6 +289,7 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    @nnx.jit(static_argnames=['train'])
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
@@ -314,69 +314,76 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
         base_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
-        
-        # Add adaptive token filter penalty normalized by number of cameras.
-        if getattr(self, "use_adaptive_token_filter", False):
-            in_warmup = self.training_step.value < self.atf_warmup_steps
-            
-            if in_warmup:
-                # During warmup, just return base loss without any ATF penalties
-                if train:
-                    # Update training step
-                    self.training_step.value = self.training_step.value + 1
-                    info["training_step"] = self.training_step.value
-                return base_loss, info
-            
-            # Check if we're using predicted loss function
-            using_predicted_loss = train and "predicted_losses" in info
-            
-            if not using_predicted_loss:
-                # Add penalty only when not using predicted loss function
-                penalty = (self.atf_weight * info['atf_expected_k']).astype(base_loss.dtype)
-                return base_loss + jnp.expand_dims(jnp.squeeze(penalty), -1), info
-            else:
-                total_loss = base_loss
-            
-            # Compute value function loss if training
-            if train:
-                # Update training step
-                self.training_step.value = self.training_step.value + 1
-                
-                actual_token_counts = jnp.sum(info["image_selection_masks"], axis=-1)  # [batch_size]
-                del info['image_selection_masks']
-                
-                predicted_losses = info["predicted_losses"]  # [batch_size, max_tokens]
-                
-                # Get predicted loss matching the actual number of tokens REMOVED.
-                # "predicted_losses" is cumulative over removal steps; index 0 should correspond to no removals (0 loss).
-                batch_size = actual_token_counts.shape[0]
-                seq_len = info["image_selection_masks"].shape[1]
-                removed_counts = jnp.clip(seq_len - actual_token_counts, 0, seq_len).astype(jnp.int32)
-                predicted_losses_padded = jnp.concatenate(
-                    [jnp.zeros((batch_size, 1), dtype=predicted_losses.dtype), predicted_losses],
-                    axis=1,
-                )
-                safe_indices = jnp.clip(removed_counts, 0, predicted_losses_padded.shape[1] - 1)
-                predicted_loss_for_counts = predicted_losses_padded[jnp.arange(batch_size), safe_indices]
-                
-                # Value function loss: MSE between predicted and actual loss
-                actual_loss_detached = jax.lax.stop_gradient(base_loss)
-                value_function_loss = jnp.mean(jnp.square(predicted_loss_for_counts - actual_loss_detached.mean(-1)))  # we need to take the mean here because the right term is per time step
-                self.value_function_loss.value = value_function_loss
-                
-                # Add value function loss to total loss
-                total_loss = total_loss + jnp.expand_dims(value_function_loss, -1)
-                
-                # Add value function metrics to info
-                info["value_function_loss"] = value_function_loss
-                info["value_function_predicted_loss"] = jnp.mean(predicted_loss_for_counts)
-                info["prediction_loss"] = jnp.mean(actual_loss_detached)
-                info["training_step"] = self.training_step.value
-            
-            return total_loss, info
+
+        if self.use_adaptive_token_filter and train:
+            return self._adaptive_token_filter_loss(base_loss, info)
         return base_loss, info
+
+    def _adaptive_token_filter_loss(self, base_loss, info):
+        """
+        Handles the adaptive token filter loss term, possibly including value function learning loss.
+        """
+        self.training_step.value = self.training_step.value + 1
+        info["training_step"] = self.training_step.value
+
+        using_predicted_loss =  "predicted_losses" in info
+
+        if not using_predicted_loss:
+            # Add penalty only when not using predicted loss function
+            penalty = (self.atf_weight * info['atf_expected_k']).astype(base_loss.dtype)
+            return base_loss + jnp.expand_dims(jnp.squeeze(penalty), -1), info
+        else:
+            total_loss = base_loss
+
+        # Compute value function loss if training
+        def compute_value_function_loss(info):
+            actual_token_counts = jnp.sum(info["image_selection_masks"], axis=-1)  # [batch_size]
+            predicted_losses = info["predicted_losses"]  # [batch_size, max_tokens]
+
+            # Get predicted loss matching the actual number of tokens REMOVED.
+            # "predicted_losses" is cumulative over removal steps; index 0 should correspond to no removals (0 loss).
+            batch_size = actual_token_counts.shape[0]
+            seq_len = info["image_selection_masks"].shape[1]
+            del info['image_selection_masks']
+            removed_counts = jnp.clip(seq_len - actual_token_counts, 0, seq_len).astype(jnp.int32)
+            predicted_losses_padded = jnp.concatenate(
+                [jnp.zeros((batch_size, 1), dtype=predicted_losses.dtype), predicted_losses],
+                axis=1,
+            )
+            safe_indices = jnp.clip(removed_counts, 0, predicted_losses_padded.shape[1] - 1)
+            predicted_loss_for_counts = predicted_losses_padded[jnp.arange(batch_size), safe_indices]
+
+            # Value function loss: MSE between predicted and actual loss
+            actual_loss_detached = jax.lax.stop_gradient(base_loss)
+            value_function_loss = jnp.mean(
+                jnp.square(predicted_loss_for_counts - actual_loss_detached.mean(-1))
+            )  # we need to take the mean here because the right term is per time step
+
+            # Add value function metrics to info
+            info["value_function_loss"] = value_function_loss
+            info["value_function_predicted_loss"] = jnp.mean(predicted_loss_for_counts)
+            info["prediction_loss"] = jnp.mean(actual_loss_detached)
+            return jnp.expand_dims(value_function_loss, -1), info
+
+        def compute_base_loss(info):
+            del info['image_selection_masks']
+            info['prediction_loss'] = 0.0
+            info['value_function_loss'] = 0.0
+            info['value_function_predicted_loss'] = 0.0
+            return jnp.zeros((1,)), info
+
+        in_warmup = self.training_step.value < self.atf_warmup_steps
+        extra_loss, info = jax.lax.cond(
+            in_warmup,
+            compute_base_loss,
+            compute_value_function_loss,
+            info
+        )
+        total_loss = total_loss + extra_loss
+
+        return total_loss, info
 
     @override
     def sample_actions(
