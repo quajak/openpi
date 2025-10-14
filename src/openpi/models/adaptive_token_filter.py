@@ -69,24 +69,29 @@ class TokenCountValueFunction(nnx.Module):
         self.num_layers = num_layers
         self.num_heads = num_heads
         
-        # Transformer layers with batch normalization
-        self.transformer_layers = {}
-        self.mlp_layers = {}
-        self.batch_norms = {}
+        # Build all layers in a single Sequential for JIT compatibility
+        layers = []
         for i in range(num_layers):
-            self.transformer_layers[f'a_{i}'] = nnx.MultiHeadAttention(
+            # Self-attention layer
+            layers.append(nnx.MultiHeadAttention(
                 num_heads=num_heads,
                 in_features=hidden_dim,
                 rngs=rngs,
                 decode=False
-            )
-            self.batch_norms[f'a_{i}'] = nnx.BatchNorm(hidden_dim, rngs=rngs)
-            self.transformer_layers[f'l_{i}'] = MLP([hidden_dim, hidden_dim], rngs=rngs)
-            self.batch_norms[f'l_{i}'] = nnx.BatchNorm(hidden_dim, rngs=rngs)
+            ))
+            layers.append(nnx.BatchNorm(hidden_dim, rngs=rngs))
+            
+            # MLP layer
+            layers.append(MLP([hidden_dim, hidden_dim], rngs=rngs))
+            layers.append(nnx.BatchNorm(hidden_dim, rngs=rngs))
+            
+        # Create sequential transformer
+        self.transformer = nnx.Sequential(*layers)
         
         # MLP to predict residual loss increases for each token position
         self.residual_mlp = MLP([hidden_dim, hidden_dim * 2, max_tokens], rngs=rngs)
     
+    @nnx.jit
     def __call__(self, image_tokens: jnp.ndarray) -> jnp.ndarray:
         """
         Args:
@@ -95,21 +100,8 @@ class TokenCountValueFunction(nnx.Module):
         Returns:
             predicted_losses: [batch_size, max_tokens] - predicted cumulative loss for each token count
         """
-        batch_size, seq_len, embed_dim = image_tokens.shape
-        
-        # Apply transformer layers with batch normalization
-        x = image_tokens
-        for i in range(self.num_layers):
-            attn_layer = self.transformer_layers[f'a_{i}']
-            mlp_layer = self.transformer_layers[f'l_{i}']
-            
-            # Self-attention
-            x = attn_layer(x)
-            x = self.batch_norms[f'a_{i}'](x)
-            
-            # MLP
-            x = mlp_layer(x)
-            x = self.batch_norms[f'l_{i}'](x)
+        # Apply transformer layers sequentially
+        x = self.transformer(image_tokens)
         
         # Elementwise max over all tokens
         x_max = jnp.max(x, axis=1)  # [batch_size, hidden_dim]
