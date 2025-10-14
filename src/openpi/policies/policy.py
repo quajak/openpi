@@ -102,10 +102,6 @@ class Policy(BasePolicy):
             "state": inputs["state"],
             "actions": actions,
         }
-        
-        # Add model info (including ATF info) to outputs if available
-        if model_info:
-            outputs["model_info"] = model_info
             
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
@@ -117,6 +113,11 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+
+        # Add model info (including ATF info) to outputs if available
+        if model_info:
+            outputs["model_info"] = model_info
+
         return outputs
 
     @property
