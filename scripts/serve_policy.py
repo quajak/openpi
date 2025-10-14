@@ -118,6 +118,7 @@ class TokenUsageLogger(_policy.BasePolicy):
         self._policy = policy
         self._wandb_enabled = wandb_enabled
         self._inference_count = 0
+        self._policy._model.AdaptiveTokenFilter.random_k_prob=0
         
     def infer(self, obs: dict) -> dict:
         """Run inference and log actual token usage statistics."""
@@ -126,6 +127,8 @@ class TokenUsageLogger(_policy.BasePolicy):
         if self._wandb_enabled:
             self._log_actual_token_usage_stats(result)
             
+        if 'model_info' in result:
+            del result['model_info']
         return result
     
     def _log_actual_token_usage_stats(self, result: dict) -> None:
@@ -176,7 +179,6 @@ class TokenUsageLogger(_policy.BasePolicy):
         # Add inference metadata
         token_stats.update({
             'evaluation/inference_count': self._inference_count,
-            'evaluation/timestamp': wandb.run.timestamp if wandb.run else 0,
         })
         
         # Log to wandb
